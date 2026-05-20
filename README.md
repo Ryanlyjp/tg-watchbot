@@ -11,6 +11,16 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 <img width="2467" height="1388" alt="470b39663485d8711c0f3d8d4e24244e" src="https://github.com/user-attachments/assets/2635584d-d2cd-4b45-8227-6d4381816bef" />
 <img width="1227" height="222" alt="8521cab29a9635743a603582ceb7ba02" src="https://github.com/user-attachments/assets/1cac8e2b-db9f-47f7-9eed-8a824de7d3d8" />
 
+## 更新日志
+
+### 2026-05-21
+
+- 默认启动改为先启动 Web 面板：未填写 `TELEGRAM_BOT_TOKEN` / `ADMIN_CHAT_ID` 时，面板仍可打开，同时 Telegram 收发、监控推送不可用。
+- 面板配置页可填写 Bot Token、管理员 ID、面板账号和清理策略；保存后需要重启服务让 Bot 配置生效。
+- 修复到期消息删除：监控推送消息支持到期自动删除，默认 `60` 分钟。
+- 保存配置时会保留 `WEB_PANEL_SESSION_SECRET`，避免保存后登录状态被重置。
+- Web 面板界面和站点图标已更新优化。
+
 ## 功能
 
 ### Telegram 双向机器人
@@ -29,6 +39,8 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
   - `/cancel`：取消待发送图片。
 - 普通用户有简单限流，防止刷屏。
 
+![示例图片](https://pic.gongyichuren.de/file/1779287173835_8521cab29a9635743a603582ceb7ba02.png)
+
 ### Web/RSS 监控
 
 - 支持两类监控：
@@ -44,6 +56,8 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 支持屏蔽词、作者、分类过滤（YAML 高级配置）。
 - 默认最低监控间隔为 60 秒。
 
+![示例图片](https://pic.gongyichuren.de/file/1779287170665_17b7c8b4040d6334ea62a108d08db644.png)
+
 ### Web 管理面板
 
 - 登录页 + HttpOnly session cookie，不使用丑陋的浏览器 Basic Auth。
@@ -54,10 +68,12 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - Bot Token / 管理员 ID / 面板账号配置页。
 - 收件箱页面，可查看用户消息和重试转发。
 - 主动发消息页面 `/send`，发送成功后会在页面显示结果，并给管理员聊天发送确认提醒。
-- 自动清理监控/RSS/网站状态数据；不会删除用户、收件箱、双向对话消息。
+- 自动清理监控/RSS/网站状态数据；支持定时删除 Telegram 监控通知消息；不会删除用户、收件箱、双向对话消息。
 - 日志页面和健康检查 `/health`。
 
-## 借鉴 / 使用的开源库
+![示例图片](https://pic.gongyichuren.de/file/1779304138340_40dc85909b22767a56dedb3721be6e47.png)
+
+## 使用的开源库
 
 本项目的业务逻辑为自写，主要使用并参考了以下开源库的公开 API 和常见用法：
 
@@ -77,7 +93,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 如果要把面板暴露到公网，建议使用 Cloudflare Access / 反代鉴权，并使用强密码。
 - Bot 只能给“已经主动私聊过 Bot 的用户”发消息，这是 Telegram Bot API 的限制。
 
-## 快速开始
+## 快速开始（推荐使用systemd 部署）
 
 ```bash
 git clone https://github.com/GongyiChuren/tg-watchbot.git tg-watchbot
@@ -87,16 +103,6 @@ python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
 cp .env.example .env
 cp config.example.yaml config.yaml
-nano .env
-```
-
-至少填写：
-
-```dotenv
-TELEGRAM_BOT_TOKEN=<your_bot_token>
-ADMIN_CHAT_ID=<your_admin_chat_id>
-WEB_PANEL_USER=admin
-WEB_PANEL_PASSWORD=<strong_password>
 ```
 
 启动：
@@ -111,11 +117,14 @@ WEB_PANEL_PASSWORD=<strong_password>
 http://127.0.0.1:8765
 ```
 
-如果只是先配置面板、还没有 Telegram Token：
+默认账号来自 `.env.example`：
 
-```bash
-./.venv/bin/python app.py --panel-only
+```text
+用户名：admin
+密码：change-me
 ```
+
+登录后进入“设置”，填写 Bot Token、管理员 Telegram 数字 chat id、面板账号和密码。保存后重启服务，Bot 才会开始收发 Telegram 消息和发送监控通知。
 
 手动跑一次监控：
 
@@ -133,14 +142,56 @@ sudo mkdir -p /opt/tg-watchbot
 sudo chown -R "$USER:$USER" /opt/tg-watchbot
 
 cd /opt/tg-watchbot
-git clone <YOUR_REPO_URL> .
+git clone https://github.com/GongyiChuren/tg-watchbot.git .
 python3 -m venv .venv
 ./.venv/bin/pip install -U pip
 ./.venv/bin/pip install -r requirements.txt
 cp .env.example .env
 cp config.example.yaml config.yaml
-nano .env
 
+# 先用前台模式打开面板，确认能登录和保存配置
+./.venv/bin/python app.py
+```
+
+在服务器本机打开：
+
+```text
+http://127.0.0.1:8765
+```
+
+默认账号来自 `.env.example`：
+
+```text
+用户名：admin
+密码：change-me
+```
+
+如果要从公网访问面板，推荐用 Cloudflare Tunnel + Zero Trust Access，不需要开放服务器入站端口，也不用把 `WEB_PANEL_HOST` 改成 `0.0.0.0`。
+
+基本步骤：
+
+1. 在 Cloudflare Zero Trust 后台进入 `Networks` -> `Tunnels`，创建一个 Cloudflared Tunnel。
+2. 按页面提示在服务器安装并启动 `cloudflared`。
+3. 添加 Public Hostname，例如 `tg.example.com`。
+4. Service 填：
+
+```text
+http://127.0.0.1:8765
+```
+
+5. 在 Zero Trust 的 `Access` 里给这个域名加登录策略，例如只允许自己的邮箱访问。
+
+临时调试也可以用 SSH 端口转发：
+
+```bash
+ssh -L 8765:127.0.0.1:8765 user@服务器IP
+```
+
+然后在自己电脑打开 `http://127.0.0.1:8765`。
+
+在面板“设置”里填好 Bot Token、管理员 ID、面板账号和密码后，停止前台进程，再安装 systemd 服务：
+
+```bash
 sudo chown -R tg-watchbot:tg-watchbot /opt/tg-watchbot
 sudo chmod 600 /opt/tg-watchbot/.env
 sudo cp systemd/tg-watchbot.service /etc/systemd/system/tg-watchbot.service
@@ -154,6 +205,8 @@ sudo journalctl -u tg-watchbot -f
 ```bash
 curl http://127.0.0.1:8765/health
 ```
+
+说明：`/restart` 命令在 systemd 下会让进程退出，由 `Restart=on-failure` 自动拉起；如果是手动 `python app.py` 启动，退出后需要自己重新执行启动命令。
 
 ## 配置说明
 
@@ -179,13 +232,15 @@ curl http://127.0.0.1:8765/health
 cleanup:
   enabled: true
   interval_minutes: 60              # 每多少分钟执行一次清理
+  monitor_message_delete_after_minutes: 60  # 监控通知消息发送后多久删除；0 表示不删除
   monitor_retention_minutes: 1440   # RSS/网站监控状态保留多久
 ```
 
 清理范围只包括：
 
 - `monitor_state`：网站/RSS 条目状态、价格/库存状态；
-- `sent_events`：监控推送去重记录。
+- `sent_events`：监控推送去重记录；
+- `monitor_messages`：等待到期删除的 Telegram 监控通知消息队列。
 
 不会删除：
 
@@ -283,4 +338,21 @@ monitors:
 
 ## License
 
-MIT
+本项目采用非商业授权。
+
+你可以：
+- 学习、研究、个人使用本项目
+- 修改代码用于非商业用途
+- 在非商业项目中使用本项目
+
+你必须：
+- 保留原作者署名
+- 在引用或二次发布时注明项目来源：
+  https://github.com/GongyiChuren/tg-watchbot
+
+你不可以：
+- 将本项目或其修改版本用于商业用途
+- 售卖本项目或基于本项目提供付费服务
+- 在未获得作者书面许可的情况下用于商业产品
+
+商业使用请先联系作者获得授权。

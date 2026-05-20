@@ -49,6 +49,7 @@ CONFIG_PATH = BASE_DIR / "config.yaml"
 ENV_PATH = BASE_DIR / ".env"
 LOG_PATH = BASE_DIR / "tg-watchbot.log"
 MIN_INTERVAL_SECONDS = 60
+DEFAULT_MONITOR_MESSAGE_DELETE_AFTER_MINUTES = 60
 
 DEFAULT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -88,6 +89,15 @@ def monitor_cleanup_settings() -> dict[str, int | bool]:
         "enabled": bool(cleanup.get("enabled", True)),
         "interval_minutes": max(1, int(cleanup.get("interval_minutes", 60))),
         "retention_minutes": max(1, int(cleanup.get("monitor_retention_minutes", 1440))),
+        "message_delete_after_minutes": max(
+            1,
+            int(
+                cleanup.get(
+                    "monitor_message_delete_after_minutes",
+                    DEFAULT_MONITOR_MESSAGE_DELETE_AFTER_MINUTES,
+                )
+            ),
+        ),
     }
 
 
@@ -136,6 +146,15 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (monitor_name, item_key)
             );
+            CREATE TABLE IF NOT EXISTS monitor_messages (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                monitor_name TEXT NOT NULL,
+                sent_at TEXT NOT NULL,
+                delete_after_seconds INTEGER NOT NULL,
+                delete_error TEXT,
+                PRIMARY KEY (chat_id, message_id)
+            );
             CREATE TABLE IF NOT EXISTS inbox_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -162,6 +181,11 @@ def now_iso() -> str:
 
 def html_escape(text: Any) -> str:
     return html.escape(str(text or ""), quote=False)
+
+
+def app_icon_data_uri() -> str:
+    svg = """<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' fill='%23f0f0f0'/><circle cx='22' cy='22' r='13' fill='%23d02020' stroke='%23121212' stroke-width='4'/><rect x='30' y='12' width='22' height='22' fill='%231040c0' stroke='%23121212' stroke-width='4'/><path d='M12 52 L30 30 L48 52 Z' fill='%23f0c020' stroke='%23121212' stroke-width='4'/></svg>"""
+    return "data:image/svg+xml," + svg
 
 
 def user_display(message: Message) -> tuple[int, str, str | None]:
@@ -321,6 +345,24 @@ async def admin_send(text: str) -> None:
         await bot.send_message(admin_chat_id, text, disable_web_page_preview=False)
     except Exception:
         logger.exception("failed to send admin notification")
+
+
+async def admin_send_monitor(text: str, monitor_name: str) -> bool:
+    if not bot or admin_chat_id is None:
+        logger.error("admin_send_monitor called before bot/admin init: %s", text)
+        return False
+    try:
+        sent = await bot.send_message(admin_chat_id, text, disable_web_page_preview=False)
+        settings = monitor_cleanup_settings()
+        record_monitor_message(
+            sent,
+            monitor_name,
+            int(settings["message_delete_after_minutes"]) * 60,
+        )
+        return True
+    except Exception:
+        logger.exception("failed to send monitor notification")
+        return False
 
 
 def is_admin_chat(message: Message) -> bool:
@@ -765,6 +807,64 @@ def event_not_sent(event_key: str, monitor_name: str, title: str, link: str) -> 
             return False
 
 
+def record_monitor_message(
+    sent_message: Message,
+    monitor_name: str,
+    delete_after_seconds: int,
+    sent_at_ts: float | None = None,
+) -> None:
+    sent_ts = time.time() if sent_at_ts is None else sent_at_ts
+    sent_at = datetime.fromtimestamp(sent_ts, timezone.utc).astimezone().isoformat(timespec="seconds")
+    with closing(db()) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO monitor_messages(
+                chat_id, message_id, monitor_name, sent_at, delete_after_seconds, delete_error
+            ) VALUES(?,?,?,?,?,NULL)
+            """,
+            (
+                sent_message.chat.id,
+                sent_message.message_id,
+                monitor_name,
+                sent_at,
+                max(1, int(delete_after_seconds)),
+            ),
+        )
+        conn.commit()
+
+
+async def delete_expired_monitor_messages(delete_bot: Any, now_ts: float | None = None) -> int:
+    now_value = time.time() if now_ts is None else now_ts
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT chat_id, message_id, sent_at, delete_after_seconds FROM monitor_messages"
+        ).fetchall()
+    deleted_count = 0
+    for row in rows:
+        sent_at_ts = datetime.fromisoformat(row["sent_at"]).timestamp()
+        if sent_at_ts + int(row["delete_after_seconds"]) > now_value:
+            continue
+        try:
+            await delete_bot.delete_message(int(row["chat_id"]), int(row["message_id"]))
+        except Exception as e:
+            logger.exception("failed to delete monitor message chat_id=%s message_id=%s", row["chat_id"], row["message_id"])
+            with closing(db()) as conn:
+                conn.execute(
+                    "UPDATE monitor_messages SET delete_error=? WHERE chat_id=? AND message_id=?",
+                    (str(e)[:1000], row["chat_id"], row["message_id"]),
+                )
+                conn.commit()
+            continue
+        with closing(db()) as conn:
+            conn.execute(
+                "DELETE FROM monitor_messages WHERE chat_id=? AND message_id=?",
+                (row["chat_id"], row["message_id"]),
+            )
+            conn.commit()
+        deleted_count += 1
+    return deleted_count
+
+
 async def run_monitor(monitor: dict[str, Any]) -> int:
     name = monitor.get("name", "unnamed")
     mtype = monitor.get("type", "web")
@@ -821,8 +921,8 @@ async def run_monitor(monitor: dict[str, Any]) -> int:
                     f"库存：{html_escape(item.stock or '-')}\n"
                     f"时间：{html_escape(now_iso())}"
                 )
-            await admin_send(text)
-            sent_count += 1
+            if await admin_send_monitor(text, name):
+                sent_count += 1
     except Exception:
         logger.exception("monitor failed: %s %s", name, url)
     return sent_count
@@ -844,16 +944,24 @@ def cleanup_monitor_data(retention_minutes: int) -> tuple[int, int]:
 
 
 async def cleanup_monitor_loop() -> None:
+    last_data_cleanup_ts = 0.0
     while True:
         settings = monitor_cleanup_settings()
-        await asyncio.sleep(int(settings["interval_minutes"]) * 60)
+        await asyncio.sleep(min(60, int(settings["interval_minutes"]) * 60))
         if not settings["enabled"]:
             continue
         try:
-            state_n, sent_n = cleanup_monitor_data(int(settings["retention_minutes"]))
+            state_n, sent_n = 0, 0
+            message_n = 0
+            if bot:
+                message_n = await delete_expired_monitor_messages(bot)
+            interval_seconds = int(settings["interval_minutes"]) * 60
+            if time.time() - last_data_cleanup_ts >= interval_seconds:
+                state_n, sent_n = cleanup_monitor_data(int(settings["retention_minutes"]))
+                last_data_cleanup_ts = time.time()
             logger.info(
-                "monitor cleanup done retention=%smin deleted monitor_state=%s sent_events=%s",
-                settings["retention_minutes"], state_n, sent_n,
+                "monitor cleanup done retention=%smin deleted monitor_state=%s sent_events=%s monitor_messages=%s",
+                settings["retention_minutes"], state_n, sent_n, message_n,
             )
         except Exception:
             logger.exception("monitor cleanup failed")
@@ -957,12 +1065,16 @@ def login_page(error: str = "") -> str:
     err = f"<div class='login-error'>{html_escape(error)}</div>" if error else ""
     return f"""<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>
 <title>登录 · tg-watchbot</title>
+<link rel=icon href="{app_icon_data_uri()}">
 <style>
-:root{{color-scheme:light}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:radial-gradient(circle at 18% 10%,#bfdbfe88,transparent 30%),radial-gradient(circle at 82% 12%,#bbf7d088,transparent 26%),linear-gradient(135deg,#f8fbff,#eef6ff 48%,#f7fee7);color:#172033;display:grid;place-items:center;padding:22px}}
-.login-card{{width:min(430px,100%);padding:34px;border:1px solid #dbeafe;border-radius:28px;background:rgba(255,255,255,.86);box-shadow:0 24px 70px #93c5fd44;backdrop-filter:blur(18px)}}
-.logo{{width:58px;height:58px;border-radius:18px;background:linear-gradient(135deg,#60a5fa,#86efac);display:grid;place-items:center;font-weight:900;color:#0f172a;font-size:26px;box-shadow:0 12px 32px #60a5fa55;margin-bottom:18px}}
-h1{{margin:0 0 8px;font-size:28px;color:#0f172a}}p{{margin:0 0 24px;color:#64748b;line-height:1.6}}label{{display:block;margin:14px 0 7px;color:#475569;font-size:14px}}input{{width:100%;border:1px solid #cbd5e1;border-radius:14px;background:#ffffff;color:#0f172a;padding:13px 14px;font-size:15px;outline:none}}input:focus{{border-color:#60a5fa;box-shadow:0 0 0 4px #bfdbfe88}}button{{width:100%;margin-top:22px;border:0;border-radius:14px;padding:13px 16px;background:linear-gradient(135deg,#3b82f6,#22c55e);color:white;font-weight:800;font-size:15px;cursor:pointer;box-shadow:0 14px 36px #60a5fa55}}button:hover{{filter:brightness(1.04)}}.login-error{{background:#fef2f2;border:1px solid #fecaca;color:#991b1b;padding:10px 12px;border-radius:12px;margin-bottom:16px}}.foot{{margin-top:18px;color:#94a3b8;font-size:13px;text-align:center}}
-</style></head><body><main class=login-card><div class=logo>⚡</div><h1>tg-watchbot</h1><p>登录后管理 Telegram 机器人、关键词监控、库存/价格提醒。</p>{err}<form method=post action=/login><label>用户名</label><input name=username autocomplete=username autofocus><label>密码</label><input name=password type=password autocomplete=current-password><button type=submit>登录面板</button></form><div class=foot>your-domain.example · Cloudflare Tunnel</div></main></body></html>"""
+:root{{color-scheme:light;--canvas:#f0f0f0;--ink:#121212;--muted:#5c5c5c;--red:#d02020;--blue:#1040c0;--yellow:#f0c020;--white:#fff}}
+*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;font-family:Outfit,Aptos,'Segoe UI',sans-serif;background:var(--canvas);color:var(--ink);display:grid;place-items:center;padding:24px;overflow:hidden}}
+body:before{{content:"";position:fixed;inset:auto auto -90px -70px;width:220px;height:220px;border:4px solid var(--ink);border-radius:50%;background:var(--yellow);z-index:-1}}body:after{{content:"";position:fixed;top:54px;right:8vw;width:150px;height:150px;background:var(--blue);border:4px solid var(--ink);transform:rotate(12deg);z-index:-1}}
+.login-card{{position:relative;width:min(420px,100%);padding:32px;border:4px solid var(--ink);border-radius:0;background:var(--white);box-shadow:8px 8px 0 var(--ink)}}
+.login-card:after{{content:"";position:absolute;right:22px;top:22px;width:24px;height:24px;background:var(--red);clip-path:polygon(50% 0,0 100%,100% 100%)}}
+.logo{{width:58px;height:58px;border:4px solid var(--ink);background:var(--white);position:relative;margin-bottom:22px;box-shadow:4px 4px 0 var(--ink)}}.logo:before{{content:"";position:absolute;left:8px;top:8px;width:18px;height:18px;border:3px solid var(--ink);border-radius:50%;background:var(--red)}}.logo:after{{content:"";position:absolute;right:7px;top:8px;width:18px;height:18px;border:3px solid var(--ink);background:var(--blue)}}.logo i{{position:absolute;left:13px;bottom:7px;width:30px;height:22px;background:var(--yellow);border:3px solid var(--ink);clip-path:polygon(50% 0,0 100%,100% 100%)}}
+h1{{margin:0 0 8px;font-size:34px;line-height:.95;text-transform:uppercase;color:var(--ink);letter-spacing:0;font-weight:900}}p{{margin:0 0 24px;color:var(--muted);line-height:1.5;font-weight:500}}label{{display:block;margin:14px 0 7px;color:var(--ink);font-size:12px;font-weight:900;text-transform:uppercase;letter-spacing:.08em}}input{{width:100%;border:3px solid var(--ink);border-radius:0;background:#fff;color:var(--ink);padding:12px 13px;font-size:15px;outline:none}}input:focus{{box-shadow:4px 4px 0 var(--blue)}}button{{width:100%;margin-top:22px;border:3px solid var(--ink);border-radius:0;padding:12px 16px;background:var(--red);color:white;font-weight:900;font-size:14px;text-transform:uppercase;letter-spacing:.08em;cursor:pointer;box-shadow:4px 4px 0 var(--ink)}}button:active{{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--ink)}}.login-error{{background:#fff;border:3px solid var(--ink);color:var(--red);padding:10px 12px;margin-bottom:16px;font-weight:800;box-shadow:4px 4px 0 var(--red)}}.foot{{margin-top:18px;color:var(--muted);font-size:13px;text-align:center;font-weight:700}}
+</style></head><body><main class=login-card><div class=logo><i></i></div><h1>tg-watchbot</h1><p>登录后管理 Telegram 机器人、关键词监控和提醒。</p>{err}<form method=post action=/login><label>用户名</label><input name=username autocomplete=username autofocus><label>密码</label><input name=password type=password autocomplete=current-password><button type=submit>登录面板</button></form><div class=foot>localhost panel</div></main></body></html>"""
 
 
 def env_values() -> dict[str, str]:
@@ -981,6 +1093,13 @@ def env_values() -> dict[str, str]:
 
 
 def write_env_values(values: dict[str, str]) -> None:
+    existing = {}
+    if ENV_PATH.exists():
+        for line in ENV_PATH.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                key, value = line.split("=", 1)
+                existing[key.strip()] = value.strip()
+    session_value = values.get("WEB_PANEL_SESSION_SECRET") or existing.get("WEB_PANEL_SESSION_SECRET", "")
     lines = [
         "# tg-watchbot environment",
         f"TELEGRAM_BOT_TOKEN={values.get('TELEGRAM_BOT_TOKEN','')}",
@@ -993,7 +1112,7 @@ def write_env_values(values: dict[str, str]) -> None:
         f"WEB_PANEL_PORT={values.get('WEB_PANEL_PORT','8765')}",
         f"WEB_PANEL_USER={values.get('WEB_PANEL_USER','admin')}",
         f"WEB_PANEL_PASSWORD={values.get('WEB_PANEL_PASSWORD','admin')}",
-        f"WEB_PANEL_SESSION_SECRET={values.get('WEB_PANEL_SESSION_SECRET','')}",
+        f"WEB_PANEL_SESSION_SECRET={session_value}",
         "",
     ]
     ENV_PATH.write_text("\n".join(lines), encoding="utf-8")
@@ -1085,14 +1204,17 @@ def monitor_from_form(
 def layout(title: str, body: str) -> str:
     return f"""<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>
 <title>{html_escape(title)} · tg-watchbot</title>
+<link rel=icon href="{app_icon_data_uri()}">
 <style>
-*{{box-sizing:border-box}}body{{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:radial-gradient(circle at 12% -8%,#dbeafe,transparent 30%),radial-gradient(circle at 88% -4%,#dcfce7,transparent 26%),linear-gradient(180deg,#f8fbff,#f3f7fb);color:#172033;margin:0}}
-a{{color:#2563eb;text-decoration:none}}a:hover{{color:#1d4ed8}} .shell{{display:grid;grid-template-columns:260px 1fr;min-height:100vh}}aside{{border-right:1px solid #e2e8f0;background:rgba(255,255,255,.78);backdrop-filter:blur(16px);padding:22px;position:sticky;top:0;height:100vh;box-shadow:8px 0 30px #dbeafe55}}main{{padding:30px;min-width:0}}.brand{{display:flex;gap:12px;align-items:center;margin-bottom:24px}}.mark{{width:42px;height:42px;border-radius:14px;background:linear-gradient(135deg,#60a5fa,#86efac);display:grid;place-items:center;color:#0f172a;font-weight:900;box-shadow:0 12px 28px #bfdbfe}}.brand b{{font-size:18px;color:#0f172a}}.brand small{{display:block;color:#64748b;margin-top:2px}}nav{{display:grid;gap:8px}}nav a{{padding:11px 12px;border-radius:12px;color:#475569;border:1px solid transparent;font-weight:650}}nav a:hover{{background:#eff6ff;border-color:#bfdbfe;color:#1d4ed8}}.top{{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:18px}}.top h1{{margin:0;font-size:28px;color:#0f172a}}.logout{{color:#dc2626}}.btn{{background:#ffffff;color:#334155;padding:8px 12px;border-radius:10px;border:1px solid #cbd5e1;display:inline-block;cursor:pointer;box-shadow:0 4px 14px #e2e8f066}}.btn:hover{{background:#f8fafc}}.btn.primary{{background:linear-gradient(135deg,#3b82f6,#22c55e);border-color:#60a5fa;color:white}}.btn.danger{{background:#fef2f2;border-color:#fecaca;color:#b91c1c}}.btn.ok{{background:#ecfdf5;border-color:#bbf7d0;color:#15803d}}
-.card{{background:rgba(255,255,255,.88);border:1px solid #e2e8f0;border-radius:20px;padding:18px;margin:14px 0;box-shadow:0 16px 45px #dbeafe66}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}}
-input,select,textarea{{width:100%;box-sizing:border-box;background:#ffffff;color:#0f172a;border:1px solid #cbd5e1;border-radius:12px;padding:11px;outline:none}}input:focus,select:focus,textarea:focus{{border-color:#60a5fa;box-shadow:0 0 0 4px #bfdbfe88}}textarea{{min-height:120px;font-family:ui-monospace,Consolas,monospace}} label{{display:block;margin:10px 0 5px;color:#475569;font-weight:650}}
-small,.muted{{color:#64748b;line-height:1.6}} table{{width:100%;border-collapse:separate;border-spacing:0}} td,th{{border-bottom:1px solid #e2e8f0;padding:11px;text-align:left;vertical-align:top}} th{{color:#64748b;font-size:13px;background:#f8fafc}}.badge{{padding:3px 9px;border-radius:999px;background:#eef2ff;color:#3730a3}} .msg{{padding:12px;border-radius:12px;background:#ecfdf5;border:1px solid #bbf7d0;color:#166534;margin:10px 0}}pre{{white-space:pre-wrap;background:#f8fafc;color:#334155;padding:12px;border-radius:12px;border:1px solid #e2e8f0;max-height:420px;overflow:auto}}
-@media(max-width:800px){{.shell{{grid-template-columns:1fr}}aside{{position:relative;height:auto}}main{{padding:18px}}}}
-</style></head><body><div class=shell><aside><div class=brand><div class=mark>⚡</div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><a href='/'>监控面板</a><a href='/inbox'>收件箱</a><a href='/send'>主动发消息</a><a href='/monitor/new'>新增监控</a><a href='/settings'>Bot / 面板设置</a><a href='/yaml'>YAML 高级编辑</a><a href='/logs'>运行日志</a><a href='/run-once'>手动检查</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启机器人</a><a class=logout href='/logout'>退出登录</a></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><span class=badge>WatchBot Panel</span></div>
+:root{{--canvas:#f0f0f0;--ink:#121212;--muted:#5c5c5c;--red:#d02020;--blue:#1040c0;--yellow:#f0c020;--white:#fff;--gray:#e0e0e0}}
+*{{box-sizing:border-box}}body{{font-family:Outfit,Aptos,'Segoe UI',sans-serif;background:var(--canvas);color:var(--ink);margin:0;letter-spacing:0}}body:before{{content:"";position:fixed;right:-70px;top:110px;width:190px;height:190px;border:4px solid var(--ink);border-radius:50%;background:var(--yellow);z-index:-1}}body:after{{content:"";position:fixed;left:190px;bottom:-80px;width:190px;height:190px;border:4px solid var(--ink);background:var(--blue);transform:rotate(45deg);z-index:-1}}
+a{{color:var(--ink);text-decoration:none}}a:hover{{text-decoration:underline}}.shell{{display:grid;grid-template-columns:238px minmax(0,1fr);min-height:100vh}}aside{{border-right:4px solid var(--ink);background:var(--white);padding:18px 14px;position:sticky;top:0;height:100vh}}main{{padding:24px 30px;min-width:0;max-width:1440px}}.brand{{display:flex;gap:10px;align-items:center;margin-bottom:20px;padding:0 4px 16px;border-bottom:4px solid var(--ink)}}.mark{{width:44px;height:44px;border:4px solid var(--ink);background:var(--white);position:relative;box-shadow:4px 4px 0 var(--ink);flex:0 0 auto}}.mark:before{{content:"";position:absolute;left:5px;top:5px;width:13px;height:13px;border:3px solid var(--ink);border-radius:50%;background:var(--red)}}.mark:after{{content:"";position:absolute;right:4px;top:5px;width:13px;height:13px;border:3px solid var(--ink);background:var(--blue)}}.mark i{{position:absolute;left:8px;bottom:4px;width:25px;height:18px;background:var(--yellow);border:3px solid var(--ink);clip-path:polygon(50% 0,0 100%,100% 100%)}}.brand b{{font-size:18px;color:var(--ink);font-weight:900;text-transform:uppercase}}.brand small{{display:block;color:var(--muted);margin-top:2px;font-weight:700}}nav{{display:grid;gap:7px}}nav a{{position:relative;padding:10px 11px;border:3px solid var(--ink);background:var(--white);color:var(--ink);font-weight:900;text-transform:uppercase;font-size:13px;box-shadow:3px 3px 0 var(--ink)}}nav a:nth-child(3n+1){{background:var(--yellow)}}nav a:nth-child(3n+2){{background:#fff}}nav a:nth-child(3n){{background:#eef2ff}}nav a:hover{{text-decoration:none;transform:translate(-1px,-1px);box-shadow:5px 5px 0 var(--ink)}}.logout{{background:var(--red)!important;color:white}}.top{{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:20px;border-bottom:4px solid var(--ink);padding-bottom:14px}}.top h1{{margin:0;font-size:34px;line-height:.95;color:var(--ink);font-weight:900;text-transform:uppercase}}.top .badge{{background:var(--blue);color:white}}
+.btn{{background:var(--white);color:var(--ink);padding:7px 11px;border:3px solid var(--ink);border-radius:0;display:inline-block;cursor:pointer;font-weight:900;line-height:1.35;text-transform:uppercase;font-size:12px;box-shadow:3px 3px 0 var(--ink)}}.btn:hover{{text-decoration:none;transform:translate(-1px,-1px);box-shadow:5px 5px 0 var(--ink)}}.btn:active{{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--ink)}}.btn.primary{{background:var(--red);color:white}}.btn.danger{{background:var(--red);color:white}}.btn.ok{{background:var(--yellow);color:var(--ink)}}.actions{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}}
+.card{{position:relative;background:var(--white);border:4px solid var(--ink);border-radius:0;padding:18px;margin:16px 0;box-shadow:8px 8px 0 var(--ink)}}.card:after{{content:"";position:absolute;top:12px;right:12px;width:14px;height:14px;background:var(--red);border:3px solid var(--ink)}}.toolbar{{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;flex-wrap:wrap;padding-right:34px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}}.form-actions{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:18px 0 0}}h2,h3{{font-weight:900;text-transform:uppercase;letter-spacing:0}}h2{{font-size:24px}}h3{{font-size:16px;border-bottom:3px solid var(--ink);padding-bottom:6px;margin-top:20px}}
+input,select,textarea{{width:100%;box-sizing:border-box;background:#fff;color:var(--ink);border:3px solid var(--ink);border-radius:0;padding:10px 11px;outline:none;font-size:14px;font-weight:600}}input:focus,select:focus,textarea:focus{{box-shadow:4px 4px 0 var(--blue)}}textarea{{min-height:116px;font-family:'Cascadia Mono',Consolas,monospace}}label{{display:block;margin:10px 0 5px;color:var(--ink);font-weight:900;font-size:12px;text-transform:uppercase;letter-spacing:.06em}}.check-row{{display:flex;gap:10px;align-items:center;flex-wrap:wrap}}.check-row label{{display:flex;gap:7px;align-items:center;margin:0;padding:8px 10px;border:3px solid var(--ink);background:var(--gray)}}.check-row input{{width:auto}}
+small,.muted{{color:var(--muted);line-height:1.5;font-weight:600}}table{{width:100%;border-collapse:collapse;border:3px solid var(--ink);background:white}}td,th{{border:3px solid var(--ink);padding:10px;text-align:left;vertical-align:top}}th{{color:var(--ink);font-size:12px;background:var(--yellow);text-transform:uppercase;letter-spacing:.06em}}tr:nth-child(even) td{{background:#fafafa}}.badge{{padding:4px 8px;border:3px solid var(--ink);border-radius:999px;background:var(--blue);color:white;font-size:12px;font-weight:900;text-transform:uppercase}}.msg{{padding:11px 12px;border:3px solid var(--ink);background:var(--yellow);color:var(--ink);margin:10px 0;font-weight:900;box-shadow:4px 4px 0 var(--ink)}}pre{{white-space:pre-wrap;background:#121212;color:#fff;padding:13px;border:4px solid var(--ink);max-height:420px;overflow:auto;box-shadow:5px 5px 0 var(--yellow)}}
+@media(max-width:860px){{.shell{{grid-template-columns:1fr}}aside{{position:relative;height:auto}}main{{padding:18px}}nav{{grid-template-columns:repeat(2,minmax(0,1fr))}}.top{{align-items:flex-start;flex-direction:column}}.card{{box-shadow:5px 5px 0 var(--ink)}}}}
+</style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><a href='/'>监控面板</a><a href='/inbox'>收件箱</a><a href='/send'>主动发消息</a><a href='/monitor/new'>新增监控</a><a href='/settings'>Bot / 面板设置</a><a href='/yaml'>YAML 高级编辑</a><a href='/logs'>运行日志</a><a href='/run-once'>手动检查</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启机器人</a><a class=logout href='/logout'>退出登录</a></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><span class=badge>WatchBot Panel</span></div>
 {body}</main></div></body></html>"""
 
 
@@ -1118,11 +1240,11 @@ def monitor_form_html(m: dict[str, Any] | None = None, idx: int | None = None) -
 <div><label>价格选择器</label><input name=price_selector value='{html_escape(selectors.get('price',''))}'></div>
 <div><label>库存选择器</label><input name=stock_selector value='{html_escape(selectors.get('stock',''))}'></div></div>
 <h3>提醒条件</h3>
-<label><input style='width:auto' type=checkbox name=keyword_match {checked('keyword_match')}> 关键词命中</label>
-<label><input style='width:auto' type=checkbox name=new_item {checked('new_item')}> 新条目</label>
-<label><input style='width:auto' type=checkbox name=price_change {checked('price_change')}> 价格变化</label>
-<label><input style='width:auto' type=checkbox name=stock_change {checked('stock_change')}> 库存变化</label>
-<p><button class='btn primary' type=submit>保存</button> <a class=btn href='/'>取消</a></p></form>"""
+<div class=check-row><label><input type=checkbox name=keyword_match {checked('keyword_match')}> 关键词命中</label>
+<label><input type=checkbox name=new_item {checked('new_item')}> 新条目</label>
+<label><input type=checkbox name=price_change {checked('price_change')}> 价格变化</label>
+<label><input type=checkbox name=stock_change {checked('stock_change')}> 库存变化</label></div>
+<div class=form-actions><button class='btn primary' type=submit>保存</button> <a class=btn href='/'>取消</a></div></form>"""
 
 
 def create_panel_app() -> FastAPI:
@@ -1163,7 +1285,7 @@ def create_panel_app() -> FastAPI:
         rows = []
         for i, m in enumerate(cfg.get("monitors") or []):
             rows.append(f"""<tr><td><span class=badge>{html_escape(m.get('type','web'))}</span></td><td><b>{html_escape(m.get('name',''))}</b><br><small>{html_escape(m.get('url',''))}</small></td><td>{html_escape(m.get('interval_seconds',60))}s</td><td>{html_escape(', '.join(m.get('keywords') or []))}</td><td><a class=btn href='/monitor/{i}/edit'>编辑</a> <a class='btn ok' href='/monitor/{i}/preview'>预览</a> <a class='btn ok' href='/monitor/{i}/run'>检查</a> <a class='btn danger' href='/monitor/{i}/delete' onclick='return confirm("确定删除？")'>删除</a></td></tr>""")
-        body = f"""<div class=card><div style='display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap'><div><h2 style='margin:0 0 6px'>监控目标</h2><p class=muted style='margin:0'>当前 {len(cfg.get('monitors') or [])} 个；不限制数量，可继续新增。保存后自动重载定时任务。</p></div><div><a class='btn primary' href='/monitor/templates'>论坛模板</a> <a class='btn primary' href='/monitor/new'>+ 新增监控</a> <a class='btn ok' href='/monitor/bulk'>批量新增</a></div></div><table style='margin-top:16px'><tr><th>类型</th><th>目标</th><th>间隔</th><th>关键词</th><th>操作</th></tr>""" + "".join(rows) + "</table></div>"
+        body = f"""<div class=card><div class=toolbar><div><h2 style='margin:0 0 6px'>监控目标</h2><p class=muted style='margin:0'>当前 {len(cfg.get('monitors') or [])} 个；保存后自动重载定时任务。</p></div><div class=actions><a class='btn' href='/monitor/templates'>论坛模板</a> <a class='btn primary' href='/monitor/new'>新增监控</a> <a class='btn ok' href='/monitor/bulk'>批量新增</a></div></div><table style='margin-top:16px'><tr><th>类型</th><th>目标</th><th>间隔</th><th>关键词</th><th>操作</th></tr>""" + "".join(rows) + "</table></div>"
         return layout("监控", body)
 
     @app.get("/monitor/new", response_class=HTMLResponse)
@@ -1192,7 +1314,7 @@ def create_panel_app() -> FastAPI:
         sample = """NodeSeek|https://www.nodeseek.com/|免费鸡,优惠码,NAT
 Linux.do|https://linux.do|公益,codex,claude
 HostLoc|https://hostloc.com|VPS,补货,优惠"""
-        body = f"""<div class=card><h2>批量新增监控</h2><p class=muted>一行一个网站，格式：<code>名称|URL|关键词1,关键词2,关键词3</code>。保存后会追加到现有列表，不会覆盖原有监控。</p><form method=post action='/monitor/bulk'><label>批量列表</label><textarea name=items style='min-height:260px' placeholder='{html_escape(sample)}'></textarea><div class=grid><div><label>类型</label><select name=mtype><option value=web>Web 网页</option><option value=rss>RSS</option></select></div><div><label>间隔秒数（最低 60）</label><input name=interval_seconds type=number min=60 value=60></div></div><h3>默认提醒条件</h3><label><input style='width:auto' type=checkbox name=keyword_match checked> 关键词命中</label><label><input style='width:auto' type=checkbox name=new_item checked> 新条目</label><label><input style='width:auto' type=checkbox name=price_change> 价格变化</label><label><input style='width:auto' type=checkbox name=stock_change> 库存变化</label><p><button class='btn primary' type=submit>批量添加</button> <a class=btn href='/'>取消</a></p></form></div>"""
+        body = f"""<div class=card><h2>批量新增监控</h2><p class=muted>一行一个网站，格式：<code>名称|URL|关键词1,关键词2,关键词3</code>。</p><form method=post action='/monitor/bulk'><label>批量列表</label><textarea name=items style='min-height:260px' placeholder='{html_escape(sample)}'></textarea><div class=grid><div><label>类型</label><select name=mtype><option value=web>Web 网页</option><option value=rss>RSS</option></select></div><div><label>间隔秒数（最低 60）</label><input name=interval_seconds type=number min=60 value=60></div></div><h3>默认提醒条件</h3><div class=check-row><label><input type=checkbox name=keyword_match checked> 关键词命中</label><label><input type=checkbox name=new_item checked> 新条目</label><label><input type=checkbox name=price_change> 价格变化</label><label><input type=checkbox name=stock_change> 库存变化</label></div><div class=form-actions><button class='btn primary' type=submit>批量添加</button> <a class=btn href='/'>取消</a></div></form></div>"""
         return layout("批量新增", body)
 
     @app.post("/monitor/bulk")
@@ -1333,25 +1455,28 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
     async def settings(_: str = Depends(panel_auth)) -> str:
         v = env_values()
         cleanup = (cfg_load_fresh().get("cleanup") or {})
-        body = f"""<h2>Bot / 面板设置</h2><div class=card><form method=post>
+        bot_ready = bool(v["TELEGRAM_BOT_TOKEN"].strip() and v["ADMIN_CHAT_ID"].strip())
+        status = "" if bot_ready else "<div class=msg>未填写 Token 或管理员 ID；网页可用，但 Bot 和监控推送不可用。</div>"
+        body = f"""<h2>Bot / 面板设置</h2>{status}<div class=card><form method=post>
 <label>Telegram Bot Token</label><input name=TELEGRAM_BOT_TOKEN value='{html_escape(v['TELEGRAM_BOT_TOKEN'])}' placeholder='123456:ABC...'>
 <label>管理员 ADMIN_CHAT_ID</label><input name=ADMIN_CHAT_ID value='{html_escape(v['ADMIN_CHAT_ID'])}'>
 <div class=grid><div><label>日志级别</label><input name=LOG_LEVEL value='{html_escape(v['LOG_LEVEL'])}'></div><div><label>面板监听地址</label><input name=WEB_PANEL_HOST value='{html_escape(v['WEB_PANEL_HOST'])}'></div><div><label>面板端口</label><input name=WEB_PANEL_PORT value='{html_escape(v['WEB_PANEL_PORT'])}'></div><div><label>面板用户</label><input name=WEB_PANEL_USER value='{html_escape(v['WEB_PANEL_USER'])}'></div><div><label>面板密码</label><input name=WEB_PANEL_PASSWORD value='{html_escape(v['WEB_PANEL_PASSWORD'])}'></div></div>
-<h3>监控数据自动清理</h3><p class=muted>只清理 RSS/网站监控状态和去重记录，不删除用户、收件箱、双向对话消息。</p><div class=grid><div><label>清理间隔（分钟）</label><input name=CLEANUP_INTERVAL_MINUTES type=number min=1 value='{html_escape(cleanup.get("interval_minutes", 60))}'></div><div><label>保留监控数据（分钟）</label><input name=CLEANUP_RETENTION_MINUTES type=number min=1 value='{html_escape(cleanup.get("monitor_retention_minutes", 1440))}'></div></div>
-<input type=hidden name=WEB_PANEL_ENABLED value='true'><p><button class='btn primary' type=submit>保存 .env / 清理设置</button></p><small>改 Token、chat_id 或面板监听端口后建议重启服务：sudo systemctl restart tg-watchbot</small></form></div>"""
+<h3>监控数据自动清理</h3><p class=muted>删除过期监控通知消息，并清理 RSS/网站监控状态和去重记录；不会删除用户、收件箱、双向对话消息。</p><div class=grid><div><label>清理间隔（分钟）</label><input name=CLEANUP_INTERVAL_MINUTES type=number min=1 value='{html_escape(cleanup.get("interval_minutes", 60))}'></div><div><label>监控通知删除时间（分钟）</label><input name=CLEANUP_MESSAGE_DELETE_AFTER_MINUTES type=number min=1 value='{html_escape(cleanup.get("monitor_message_delete_after_minutes", 60))}'></div><div><label>保留监控数据（分钟）</label><input name=CLEANUP_RETENTION_MINUTES type=number min=1 value='{html_escape(cleanup.get("monitor_retention_minutes", 1440))}'></div></div>
+<input type=hidden name=WEB_PANEL_ENABLED value='true'><div class=form-actions><button class='btn primary' type=submit>保存设置</button></div><small>改 Token、管理员 ID 或端口后需要重启。</small></form></div>"""
         return layout("设置", body)
 
     @app.post("/settings", response_class=HTMLResponse)
-    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440)) -> str:
+    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440)) -> str:
         write_env_values(locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED})
         cfg = cfg_load_fresh()
         cfg["cleanup"] = {
             "enabled": True,
             "interval_minutes": max(1, int(CLEANUP_INTERVAL_MINUTES)),
+            "monitor_message_delete_after_minutes": max(1, int(CLEANUP_MESSAGE_DELETE_AFTER_MINUTES)),
             "monitor_retention_minutes": max(1, int(CLEANUP_RETENTION_MINUTES)),
         }
         cfg_save(cfg)
-        return layout("已保存", "<div class=msg>.env 和监控清理设置已保存。Token/chat_id 需重启服务后生效。</div><p><a class=btn href='/settings'>返回</a></p>")
+        return layout("已保存", "<div class=msg>已保存，不会自动重启；修改 Token/管理员 ID 后请重启。</div><p><a class=btn href='/settings'>返回</a> <a class=btn href='/restart'>重启机器人</a></p>")
 
 
     @app.get("/send", response_class=HTMLResponse)
@@ -1366,11 +1491,11 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
             username = f"@{u['username']}" if u["username"] else ""
             label = f"{u['full_name'] or u['user_id']} {username} · {u['user_id']} {blocked}"
             options.append(f"<option value='{u['user_id']}'>{html_escape(label)}</option>")
-        body = f"""<div class=card><h2>主动发消息</h2><p class=muted>只能发送给已经私聊过 Bot 的用户；这是 Telegram Bot API 限制。</p><form method=post action='/send'>
+        body = f"""<div class=card><h2>主动发消息</h2><p class=muted>只能发送给已经私聊过 Bot 的用户。</p><form method=post action='/send'>
 <label>选择用户</label><select name=user_id>{''.join(options)}</select>
 <label>或手动输入 user_id</label><input name=manual_user_id placeholder='例如 123456789'>
 <label>消息内容</label><textarea name=text style='min-height:180px' required></textarea>
-<p><button class='btn primary' type=submit>发送消息</button> <a class=btn href='/inbox'>查看收件箱</a></p></form></div>"""
+<div class=form-actions><button class='btn primary' type=submit>发送消息</button> <a class=btn href='/inbox'>查看收件箱</a></div></form></div>"""
         return layout("主动发消息", body)
 
     @app.post("/send", response_class=HTMLResponse)
@@ -1468,6 +1593,11 @@ def validate_env() -> tuple[str, int]:
     return token, int(admin)
 
 
+def bot_env_configured() -> bool:
+    load_dotenv(ENV_PATH, override=True)
+    return bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip() and os.getenv("ADMIN_CHAT_ID", "").strip())
+
+
 async def main_async(run_once: bool = False, panel_only: bool = False) -> None:
     global bot, admin_chat_id, config, scheduler_ref
     load_dotenv(ENV_PATH, override=True)
@@ -1490,6 +1620,13 @@ async def main_async(run_once: bool = False, panel_only: bool = False) -> None:
         if bot:
             await bot.session.close()
         return
+    await start_panel_server()
+    if not bot_env_configured():
+        logger.warning(
+            "Telegram bot is not configured. Web panel is available, but Telegram polling, monitor notifications, and admin/user messaging will not work until TELEGRAM_BOT_TOKEN and ADMIN_CHAT_ID are saved, then the service is restarted."
+        )
+        while True:
+            await asyncio.sleep(3600)
     token, admin_chat_id = validate_env()
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
@@ -1498,7 +1635,6 @@ async def main_async(run_once: bool = False, panel_only: bool = False) -> None:
     scheduler_ref = scheduler
     schedule_monitors(scheduler)
     scheduler.start()
-    await start_panel_server()
     asyncio.create_task(flush_pending_loop())
     asyncio.create_task(cleanup_monitor_loop())
     await admin_send(f"tg-watchbot 已启动\n时间：{now_iso()}")

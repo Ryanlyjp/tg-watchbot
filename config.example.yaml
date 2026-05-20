@@ -44,4 +44,5 @@ monitors:
 cleanup:
   enabled: true
   interval_minutes: 60
+  monitor_message_delete_after_minutes: 60
   monitor_retention_minutes: 1440
