@@ -33,6 +33,8 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 
 - TG 群监听功能增强：支持可视化配置监听规则、AI 总结参数与防刷屏策略。
 - TG 群监听新增“已发现群聊”：自动显示 Bot 收到过消息的群聊 `chat_id`，可一键创建监听。
+- TG 群监听新增“监听来源”选项：`Bot` / `用户会话`（可用于 Bot 无法加入的群）。
+- 设置页新增 `TG_API_ID`、`TG_API_HASH`、`TG_API_SESSION` 可视化配置；用于用户会话监听。
 - 新增 `/update` 安全更新流程：显示本地/远端 commit、ahead/behind、工作区状态；仅允许 `ff-only` 更新。
 - 更新前若检测到本地未提交改动，会拒绝更新；避免覆盖本地代码。
 - 新增“回滚上次更新”按钮：更新前自动记录回滚点，可一键回滚并重启。
@@ -301,6 +303,9 @@ curl http://127.0.0.1:8765/health
 | `WEB_PANEL_USER` | 面板用户名 |
 | `WEB_PANEL_PASSWORD` | 面板密码 |
 | `WEB_PANEL_SESSION_SECRET` | Session Secret，留空会自动生成并写回 `.env` |
+| `TG_API_ID` | （可选）Telegram API ID，用于“TG 群监听=用户会话” |
+| `TG_API_HASH` | （可选）Telegram API Hash，用于“TG 群监听=用户会话” |
+| `TG_API_SESSION` | （可选）Telethon StringSession，用于“TG 群监听=用户会话” |
 
 ### `config.yaml`
 
@@ -329,6 +334,7 @@ TG 群关键词监听（可选，默认关闭）：
 group_monitors:
   - name: TG 群关键词监听
     enabled: false
+    listen_source: bot
     chat_id: -1001234567890
     keywords:
       - VPS
@@ -350,6 +356,9 @@ group_monitors:
 
 - 命中 `keywords` 且未命中 `exclude_keywords` 时，会给管理员发送摘要。
 - TG 群监听页面会展示“已发现群聊”（Bot 收到过消息的群），可直接点“用此群创建监听”自动填入 `chat_id`。
+- `listen_source` 支持：
+  - `bot`：默认，使用 Bot 接收群消息（需把 Bot 拉进群）
+  - `user_session`：使用用户会话接收群消息（适合 Bot 无法入群）
 - `summary_mode` 支持：
   - `template`：固定模板摘要（默认）
   - `ai`：调用 AI 生成摘要（在 TG 群监听页面可视化配置）
@@ -360,6 +369,7 @@ group_monitors:
 - `ai_min_interval_seconds`：同一个群监听最小推送间隔（防刷屏）
 - `ai_dedupe_window_seconds`：相同内容摘要去重窗口（防重复）
 - 机器人想收到群里普通消息，需要在 `@BotFather` 执行 `/setprivacy` 关闭隐私模式。
+- 若使用 `listen_source=user_session`，需在设置页填写 `TG_API_ID`、`TG_API_HASH`、`TG_API_SESSION` 后重启。
 
 更新代码（`/update`）已支持安全检查：
 - 显示本地/远端 commit、ahead/behind、工作区是否干净

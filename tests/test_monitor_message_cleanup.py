@@ -324,6 +324,7 @@ class PanelHtmlContractTest(unittest.TestCase):
             "name=exclude_keywords",
             "name=enabled",
             "name=notify_telegram",
+            "name=listen_source",
             "name=summary_mode",
             "name=ai_interface",
             "name=ai_base_url",
@@ -419,6 +420,7 @@ class GroupMonitorTest(unittest.TestCase):
                 self.assertEqual(-10099, saved["chat_id"])
                 self.assertEqual("template", saved["summary_mode"])
                 self.assertEqual("responses", saved["ai_interface"])
+                self.assertEqual("bot", saved["listen_source"])
                 self.assertEqual(0.2, saved["ai_temperature"])
                 self.assertEqual(1, saved["ai_timeout_seconds"])
                 self.assertEqual(app.DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS, saved["ai_min_interval_seconds"])
@@ -522,6 +524,24 @@ class MonitorRuntimeAndUpdateTest(unittest.TestCase):
             self.assertIsNotNone(monitor)
             self.assertEqual(-10001, monitor["chat_id"])
             self.assertIsNone(app.group_monitor_for_chat(-10002))
+        finally:
+            app.config = old_config
+
+    def test_group_monitor_for_chat_and_source_returns_matched_monitor(self) -> None:
+        old_config = app.config
+        app.config = {
+            "group_monitors": [
+                {"enabled": True, "chat_id": -10001, "listen_source": "bot", "keywords": ["vps"]},
+                {"enabled": True, "chat_id": -10001, "listen_source": "user_session", "keywords": ["api"]},
+            ]
+        }
+        try:
+            monitor_bot = app.group_monitor_for_chat_and_source(-10001, "bot")
+            monitor_session = app.group_monitor_for_chat_and_source(-10001, "user_session")
+            self.assertIsNotNone(monitor_bot)
+            self.assertIsNotNone(monitor_session)
+            self.assertEqual("bot", monitor_bot["listen_source"])
+            self.assertEqual("user_session", monitor_session["listen_source"])
         finally:
             app.config = old_config
 
