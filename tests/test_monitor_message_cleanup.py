@@ -651,6 +651,28 @@ class MonitorRuntimeAndUpdateTest(unittest.TestCase):
             app.admin_chat_ids = old_admin_chat_ids
             app.summarize_group_message_ai = old_ai
 
+    def test_record_and_list_discovered_group_chats(self) -> None:
+        msg = SimpleNamespace(
+            chat=SimpleNamespace(id=-100123, type="supergroup", title="测试群A", username="group_a"),
+            text="hello",
+            caption=None,
+            reply_to_message=None,
+            message_id=1,
+            from_user=SimpleNamespace(id=11, first_name="u", last_name="", username="u1"),
+            content_type="text",
+        )
+        app.record_discovered_group_chat(msg)
+        rows = app.list_discovered_group_chats()
+        self.assertTrue(rows)
+        self.assertEqual(-100123, rows[0]["chat_id"])
+        self.assertEqual("测试群A", rows[0]["title"])
+
+    def test_group_monitors_page_keeps_discovered_chat_actions_markup(self) -> None:
+        source = Path("app.py").read_text(encoding="utf-8")
+        self.assertIn("已发现群聊", source)
+        self.assertIn("用此群创建监听", source)
+        self.assertIn("/group-monitors/new?chat_id=", source)
+
 
 if __name__ == "__main__":
     unittest.main()

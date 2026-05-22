@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import quote_plus, urljoin
 
 import feedparser
 import httpx
@@ -211,6 +211,13 @@ def init_db() -> None:
                 meta_key TEXT PRIMARY KEY,
                 meta_value TEXT,
                 updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS discovered_group_chats (
+                chat_id INTEGER PRIMARY KEY,
+                title TEXT,
+                username TEXT,
+                last_seen_at TEXT NOT NULL,
+                active INTEGER DEFAULT 1
             );
             """
         )
@@ -840,6 +847,46 @@ def get_monitor_status_badge(status: dict[str, Any] | None) -> str:
     return "正常"
 
 
+def record_discovered_group_chat(message: Message) -> None:
+    if message.chat.type not in {"group", "supergroup"}:
+        return
+    chat_id = int(message.chat.id)
+    title = str(getattr(message.chat, "title", "") or str(chat_id))
+    username = str(getattr(message.chat, "username", "") or "")
+    with closing(db()) as conn:
+        conn.execute(
+            """
+            INSERT INTO discovered_group_chats(chat_id, title, username, last_seen_at, active)
+            VALUES(?,?,?,?,1)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                title=excluded.title,
+                username=excluded.username,
+                last_seen_at=excluded.last_seen_at,
+                active=1
+            """,
+            (chat_id, title, username, now_iso()),
+        )
+        conn.commit()
+
+
+def list_discovered_group_chats(limit: int = 200) -> list[dict[str, Any]]:
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT chat_id, title, username, last_seen_at, active FROM discovered_group_chats ORDER BY last_seen_at DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+    return [
+        {
+            "chat_id": int(row["chat_id"]),
+            "title": str(row["title"] or row["chat_id"]),
+            "username": str(row["username"] or ""),
+            "last_seen_at": str(row["last_seen_at"] or ""),
+            "active": bool(row["active"]),
+        }
+        for row in rows
+    ]
+
+
 def lookup_reply_target(admin_chat: int, admin_message_id: int) -> int | None:
     with closing(db()) as conn:
         row = conn.execute(
@@ -1189,6 +1236,7 @@ async def user_message(message: Message) -> None:
     if message.chat.type != "private":
         if message.chat.type in {"group", "supergroup"}:
             try:
+                record_discovered_group_chat(message)
                 await handle_group_keyword_message(message)
             except Exception:
                 logger.exception("group keyword handling failed chat_id=%s message_id=%s", message.chat.id, message.message_id)
@@ -2175,6 +2223,7 @@ def create_panel_app() -> FastAPI:
     async def group_monitors_page(_: str = Depends(panel_auth)) -> str:
         cfg = cfg_load_fresh()
         rows = cfg.get("group_monitors") or []
+        discovered = list_discovered_group_chats()
         trs = []
         for i, gm in enumerate(rows):
             if not isinstance(gm, dict):
@@ -2186,6 +2235,15 @@ def create_panel_app() -> FastAPI:
             trs.append(
                 f"""<tr><td>{i+1}</td><td><b>{html_escape(gm.get('name') or gm.get('chat_id') or '-')}</b><br><small>{html_escape(gm.get('chat_id') or '-')}</small></td><td>{enabled}<br><small>{notify}</small></td><td>{html_escape(kws)}</td><td>{html_escape(exs)}</td><td><a class=btn href='/group-monitors/{i}/edit'>编辑</a> <a class='btn danger' href='/group-monitors/{i}/delete' onclick='return confirm("确定删除？")'>删除</a></td></tr>"""
             )
+        discovered_rows = []
+        for row in discovered:
+            title = row["title"]
+            chat_id = row["chat_id"]
+            username = f"@{row['username']}" if row["username"] else "-"
+            create_link = f"/group-monitors/new?chat_id={chat_id}&name={quote_plus(title)}"
+            discovered_rows.append(
+                f"""<tr><td><b>{html_escape(title)}</b><br><small>{html_escape(username)}</small></td><td><code>{chat_id}</code></td><td>{html_escape(row['last_seen_at'])}</td><td><a class='btn ok' href='{create_link}'>用此群创建监听</a></td></tr>"""
+            )
         body = (
             "<div class=card><div class=toolbar><div><h2 style='margin:0 0 6px'>TG 群关键词监听</h2>"
             "<p class=muted style='margin:0'>监听选定群并在命中关键词时给管理员发送摘要。"
@@ -2193,12 +2251,40 @@ def create_panel_app() -> FastAPI:
             "<div class=actions><a class='btn primary' href='/group-monitors/new'>新增监听</a></div></div>"
             "<table style='margin-top:16px'><tr><th>#</th><th>监听</th><th>状态</th><th>关键词</th><th>排除词</th><th>操作</th></tr>"
             + "".join(trs) + "</table></div>"
+            + "<div class=card><h2>已发现群聊</h2><p class=muted>Bot 在群里收到消息后会自动记录群信息。可直接选择群聊创建监听。</p>"
+            + "<table><tr><th>群聊</th><th>chat_id</th><th>最近活跃</th><th>操作</th></tr>"
+            + ("".join(discovered_rows) if discovered_rows else "<tr><td colspan='4'>暂无已发现群聊。先把 Bot 拉进群并发送一条消息。</td></tr>")
+            + "</table></div>"
         )
         return layout("TG 群监听", body)
 
     @app.get("/group-monitors/new", response_class=HTMLResponse)
-    async def group_monitor_new(_: str = Depends(panel_auth)) -> str:
-        return layout("新增 TG 群监听", group_monitor_form_html())
+    async def group_monitor_new(
+        _: str = Depends(panel_auth),
+        chat_id: str = "",
+        name: str = "",
+    ) -> str:
+        preset = None
+        if chat_id.strip() or name.strip():
+            preset = {
+                "enabled": True,
+                "chat_id": chat_id.strip(),
+                "name": name.strip(),
+                "keywords": [],
+                "exclude_keywords": [],
+                "notify_telegram": True,
+                "summary_mode": "template",
+                "ai_base_url": "",
+                "ai_api_key": "",
+                "ai_model": "gpt-4o-mini",
+                "ai_interface": "responses",
+                "ai_temperature": 0.2,
+                "ai_timeout_seconds": 30,
+                "ai_prompt": "",
+                "ai_min_interval_seconds": DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS,
+                "ai_dedupe_window_seconds": DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS,
+            }
+        return layout("新增 TG 群监听", group_monitor_form_html(preset))
 
     @app.get("/group-monitors/{idx}/edit", response_class=HTMLResponse)
     async def group_monitor_edit(idx: int, _: str = Depends(panel_auth)) -> str:
