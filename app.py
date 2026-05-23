@@ -2242,6 +2242,9 @@ tr:nth-child(even) td{{background:#fafafa}}
 .badge{{padding:4px 8px;border:3px solid var(--ink);border-radius:999px;background:var(--blue);color:white;font-size:12px;font-weight:900;text-transform:uppercase}}
 .msg{{padding:11px 12px;border:3px solid var(--ink);background:var(--yellow);color:var(--ink);margin:10px 0;font-weight:900;box-shadow:4px 4px 0 var(--ink)}}
 pre{{white-space:pre-wrap;background:#121212;color:#fff;padding:13px;border:4px solid var(--ink);max-height:420px;overflow:auto;box-shadow:5px 5px 0 var(--yellow)}}
+.friend-links{{margin-top:18px;padding-top:12px;border-top:3px solid var(--ink);display:flex;gap:8px;align-items:center;flex-wrap:wrap}}
+.friend-links b{{font-size:12px;font-weight:900;text-transform:uppercase}}
+.friend-links a{{font-weight:900}}
 @keyframes mainIn{{from{{opacity:.0;transform:translateY(8px)}}to{{opacity:1;transform:none}}}}
 @keyframes floatA{{from{{transform:translateY(0)}}to{{transform:translateY(-8px)}}}}
 @keyframes floatB{{from{{transform:rotate(45deg) translateY(0)}}to{{transform:rotate(45deg) translateY(-10px)}}}}
@@ -2257,7 +2260,7 @@ pre{{white-space:pre-wrap;background:#121212;color:#fff;padding:13px;border:4px 
   *,*::before,*::after{{animation:none!important;transition:none!important}}
 }}
 </style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><section><b>消息</b><a href='/inbox'>收件箱</a><a href='/users'>用户管理</a><a href='/send'>主动发消息</a><a href='/replies'>快捷回复</a><a href='/rules'>私聊广告拦截</a></section><section><b>监控</b><a href='/'>监控面板</a><a href='/monitor/new'>新增监控</a><a href='/group-monitors'>TG 群监听</a><a href='/monitor/events'>推送历史</a><a href='/run-once'>手动检查</a></section><section><b>配置</b><a href='/settings'>Bot / 面板设置</a><a href='/yaml'>YAML 高级编辑</a><a href='/config/export'>导出配置</a></section><section><b>系统</b><a href='/update'>更新代码</a><a href='/logs'>运行日志</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启机器人</a><a class=logout href='/logout'>退出登录</a></section></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><span class=badge>WatchBot Panel</span></div>
-{body}</main></div></body></html>"""
+{body}<div class=friend-links><b>友链</b><a href='https://linux.do' target='_blank' rel='noopener noreferrer'>Linux.do</a><span>·</span><a href='https://www.nodeseek.com' target='_blank' rel='noopener noreferrer'>NodeSeek</a></div></main></div></body></html>"""
 
 
 def monitor_form_html(m: dict[str, Any] | None = None, idx: int | None = None) -> str:
