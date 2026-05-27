@@ -469,6 +469,61 @@ class MonitorMessageCleanupTest(unittest.TestCase):
             else:
                 os.environ["ADMIN_FORUM_GROUP_ID"] = old_group
 
+    def test_user_message_forum_mode_also_mirrors_to_admin_chat(self) -> None:
+        old_bot = app.bot
+        old_config = app.config
+        old_admin_chat_ids = app.admin_chat_ids
+        old_mode = os.environ.get("ADMIN_ROUTE_MODE")
+        old_group = os.environ.get("ADMIN_FORUM_GROUP_ID")
+        fake_bot = FakeBot()
+        app.bot = fake_bot
+        app.admin_chat_ids = [1001]
+        app.config = {"bot": {"spam_filter": {"enabled": False}, "rate_limit": {"window_seconds": 10, "max_messages": 99}}}
+        os.environ["ADMIN_ROUTE_MODE"] = "forum_topic"
+        os.environ["ADMIN_FORUM_GROUP_ID"] = "-1001234567890"
+
+        class FakePrivateMessage:
+            def __init__(self) -> None:
+                self.chat = SimpleNamespace(id=2001, type="private")
+                self.from_user = SimpleNamespace(id=2001, first_name="Alice", last_name="", username="alice")
+                self.text = "你好，我想咨询"
+                self.caption = None
+                self.message_id = 5001
+                self.content_type = "text"
+                self.answers: list[str] = []
+                self.copy_calls: list[tuple[int, int | None, int | None]] = []
+
+            async def answer(self, text: str):
+                self.answers.append(text)
+
+            async def copy_to(self, chat_id: int, reply_to_message_id=None, message_thread_id=None):
+                self.copy_calls.append((chat_id, reply_to_message_id, message_thread_id))
+                return SimpleNamespace(message_id=6006)
+
+        message = FakePrivateMessage()
+        try:
+            asyncio.run(app.user_message(message))
+            self.assertEqual([-1001234567890, 1001], fake_bot.sent_chat_ids)
+            self.assertEqual([777, None], fake_bot.sent_message_threads)
+            self.assertEqual(
+                [(-1001234567890, 3003, 777), (1001, 3003, None)],
+                message.copy_calls,
+            )
+            self.assertEqual(2001, app.lookup_reply_target(1001, 3003))
+            self.assertEqual(["已转交管理员。"], message.answers)
+        finally:
+            app.bot = old_bot
+            app.config = old_config
+            app.admin_chat_ids = old_admin_chat_ids
+            if old_mode is None:
+                os.environ.pop("ADMIN_ROUTE_MODE", None)
+            else:
+                os.environ["ADMIN_ROUTE_MODE"] = old_mode
+            if old_group is None:
+                os.environ.pop("ADMIN_FORUM_GROUP_ID", None)
+            else:
+                os.environ["ADMIN_FORUM_GROUP_ID"] = old_group
+
     def test_admin_reply_by_message_uses_forum_thread_mapping_without_reply(self) -> None:
         old_bot = app.bot
         old_admin_chat_ids = app.admin_chat_ids

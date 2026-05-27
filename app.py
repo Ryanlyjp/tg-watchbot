@@ -369,6 +369,13 @@ def relay_admin_chat_ids() -> list[int]:
     return admin_notification_chat_ids()
 
 
+def forum_mirror_admin_chat_ids() -> list[int]:
+    if not forum_topic_enabled():
+        return []
+    group_id = admin_forum_group_id()
+    return [chat_id for chat_id in admin_notification_chat_ids() if group_id is None or int(chat_id) != int(group_id)]
+
+
 def recognized_admin_chat_ids() -> list[int]:
     ids = admin_notification_chat_ids()
     group_id = admin_forum_group_id() if forum_topic_enabled() else None
@@ -1745,6 +1752,19 @@ async def user_message(message: Message) -> None:
             save_message_map(group_id, copied.message_id, uid, message.message_id)
             first_header_id = sent.message_id
             first_copy_id = copied.message_id
+            for chat_id in forum_mirror_admin_chat_ids():
+                try:
+                    mirror_sent = await bot.send_message(chat_id, header)  # type: ignore[union-attr]
+                    save_message_map(chat_id, mirror_sent.message_id, uid, message.message_id)
+                    mirror_copied = await message.copy_to(chat_id, reply_to_message_id=mirror_sent.message_id)  # type: ignore[arg-type]
+                    save_message_map(chat_id, mirror_copied.message_id, uid, message.message_id)
+                except Exception:
+                    logger.exception(
+                        "failed to mirror forum user message to admin chat_id=%s user_id=%s inbox_id=%s",
+                        chat_id,
+                        uid,
+                        inbox_id,
+                    )
         else:
             for chat_id in relay_admin_chat_ids():
                 sent = await bot.send_message(chat_id, header)  # type: ignore[union-attr]
