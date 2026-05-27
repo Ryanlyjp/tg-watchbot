@@ -338,8 +338,7 @@ class MonitorMessageCleanupTest(unittest.TestCase):
         try:
             asyncio.run(app.admin_reply_by_message(message))
             self.assertEqual([(2001, "reply-photo", "资料图")], fake_bot.sent_photos)
-            self.assertTrue(message.replies)
-            self.assertIn("类型=photo", message.replies[0])
+            self.assertEqual([], message.replies)
             with closing(sqlite3.connect(app.DB_PATH)) as conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute(
@@ -450,12 +449,13 @@ class MonitorMessageCleanupTest(unittest.TestCase):
             asyncio.run(app.user_message(message))
             self.assertEqual([(-1001234567890, "Alice @alice | 2001")], fake_bot.created_topics)
             self.assertEqual([-1001234567890], fake_bot.sent_chat_ids)
+            self.assertEqual(["#1 Alice\n<code>2001</code> · @alice"], fake_bot.sent_texts)
             self.assertEqual([777], fake_bot.sent_message_threads)
             self.assertEqual([(-1001234567890, 3003, 777)], message.copy_calls)
             topic = app.get_forum_topic_by_user(2001)
             self.assertIsNotNone(topic)
             self.assertEqual(777, topic["message_thread_id"])
-            self.assertEqual(["已转交管理员。"], message.answers)
+            self.assertEqual([], message.answers)
         finally:
             app.bot = old_bot
             app.config = old_config
@@ -504,13 +504,17 @@ class MonitorMessageCleanupTest(unittest.TestCase):
         try:
             asyncio.run(app.user_message(message))
             self.assertEqual([-1001234567890, 1001], fake_bot.sent_chat_ids)
+            self.assertEqual(
+                ["#1 Alice\n<code>2001</code> · @alice", "#1 Alice\n<code>2001</code> · @alice"],
+                fake_bot.sent_texts,
+            )
             self.assertEqual([777, None], fake_bot.sent_message_threads)
             self.assertEqual(
                 [(-1001234567890, 3003, 777), (1001, 3003, None)],
                 message.copy_calls,
             )
             self.assertEqual(2001, app.lookup_reply_target(1001, 3003))
-            self.assertEqual(["已转交管理员。"], message.answers)
+            self.assertEqual([], message.answers)
         finally:
             app.bot = old_bot
             app.config = old_config
@@ -555,8 +559,7 @@ class MonitorMessageCleanupTest(unittest.TestCase):
         try:
             asyncio.run(app.admin_reply_by_message(message))
             self.assertEqual([2001], fake_bot.sent_chat_ids)
-            self.assertTrue(message.replies)
-            self.assertIn("message_id=3003", message.replies[0])
+            self.assertEqual([], message.replies)
         finally:
             app.bot = old_bot
             app.admin_chat_ids = old_admin_chat_ids

@@ -1307,6 +1307,24 @@ def stored_message_preview(text: str | None, message_type: str | None) -> str:
     return labels.get(str(message_type or "message"), "(非文本/媒体消息)")
 
 
+def compact_admin_header(
+    inbox_id: int,
+    user_id: int,
+    full_name: str,
+    username: str | None,
+    note: str | None = None,
+) -> str:
+    title = html_escape(full_name.strip() or username or str(user_id))
+    meta = [f"<code>{user_id}</code>"]
+    if username:
+        meta.append(f"@{html_escape(username)}")
+    note_text = str(note or "").strip()
+    if note_text:
+        short_note = note_text if len(note_text) <= 32 else note_text[:29] + "..."
+        meta.append(f"备注:{html_escape(short_note)}")
+    return f"#{inbox_id} {title}\n" + " · ".join(meta)
+
+
 async def send_text_to_user(user_id: int, text: str, source: str = "web") -> int:
     if is_blocked(user_id):
         raise ValueError(f"用户 {user_id} 已被封禁")
@@ -1671,10 +1689,7 @@ async def admin_reply_by_message(message: Message) -> None:
         if is_blocked(target):
             await message.reply(f"错误：用户 {target} 已被封禁，先 /unblock {target}")
             return
-        message_id = await copy_message_to_user(target, message, "tg:reply")
-        await message.reply(
-            f"已发送给用户 {target}，message_id={message_id}，类型={html_escape(message_content_type(message))}"
-        )
+        await copy_message_to_user(target, message, "tg:reply")
     except TelegramAPIError as e:
         logger.exception("admin reply forwarding failed")
         await message.reply(f"发送失败：{e}")
@@ -1730,14 +1745,7 @@ async def user_message(message: Message) -> None:
         return
     user_row = get_user(uid)
     note = user_row["note"] if user_row and "note" in user_row.keys() else ""
-    header = (
-        f"[用户消息 #{inbox_id}]\n"
-        f"user_id: <code>{uid}</code>\n"
-        f"name: {html_escape(full)}\n"
-        f"username: @{html_escape(username or '')}\n"
-        f"note: {html_escape(note)}\n"
-        f"time: {html_escape(now_iso())}"
-    )
+    header = compact_admin_header(inbox_id, uid, full, username, note)
     try:
         first_header_id = None
         first_copy_id = None
@@ -1774,7 +1782,6 @@ async def user_message(message: Message) -> None:
                 first_header_id = first_header_id or sent.message_id
                 first_copy_id = first_copy_id or copied.message_id
         mark_inbox_forwarded(inbox_id, first_header_id, first_copy_id)
-        await message.answer("已转交管理员。")
     except Exception as e:
         mark_inbox_error(inbox_id, repr(e))
         logger.exception("failed to relay user message, saved inbox_id=%s", inbox_id)
