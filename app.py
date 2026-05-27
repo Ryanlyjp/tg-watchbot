@@ -358,7 +358,13 @@ def create_inbox_message(message: Message, user_id: int, full_name: str, usernam
         return int(cur.lastrowid)
 
 
-def create_outbox_message(user_id: int, text: str, source: str, user_message_id: int | None = None) -> int:
+def create_outbox_message(
+    user_id: int,
+    text: str,
+    source: str,
+    user_message_id: int | None = None,
+    message_type: str = "text",
+) -> int:
     row = get_user(user_id)
     username = row["username"] if row else None
     full_name = row["full_name"] if row else str(user_id)
@@ -368,7 +374,19 @@ def create_outbox_message(user_id: int, text: str, source: str, user_message_id:
             INSERT INTO inbox_messages(user_id, username, full_name, user_message_id, direction, source, message_type, text, forwarded, created_at, forwarded_at)
             VALUES(?,?,?,?,?,?,?,?,?,?,?)
             """,
-            (user_id, username, full_name, user_message_id, "out", source, "text", text, 1, now_iso(), now_iso()),
+            (
+                user_id,
+                username,
+                full_name,
+                user_message_id,
+                "out",
+                source,
+                message_type,
+                text,
+                1,
+                now_iso(),
+                now_iso(),
+            ),
         )
         conn.commit()
         return int(cur.lastrowid)
@@ -1117,15 +1135,61 @@ async def admin_send_monitor(text: str, monitor_name: str) -> bool:
     return sent_any
 
 
+def message_content_type(message: Message) -> str:
+    return str(getattr(message, "content_type", None) or "message")
+
+
+def message_log_text(message: Message) -> str:
+    text = str(getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
+    if text:
+        return text
+    labels = {
+        "photo": "[图片]",
+        "video": "[视频]",
+        "document": "[文件]",
+        "audio": "[音频]",
+        "voice": "[语音]",
+        "video_note": "[视频消息]",
+        "sticker": "[贴纸]",
+        "animation": "[动图]",
+        "location": "[位置]",
+        "contact": "[联系人]",
+    }
+    return labels.get(message_content_type(message), "(非文本/媒体消息)")
+
+
 async def send_text_to_user(user_id: int, text: str, source: str = "web") -> int:
     if is_blocked(user_id):
         raise ValueError(f"用户 {user_id} 已被封禁")
     if not bot:
         raise RuntimeError("Bot 尚未初始化")
     sent = await bot.send_message(user_id, text.strip())
-    create_outbox_message(user_id, text.strip(), source, sent.message_id)
+    create_outbox_message(user_id, text.strip(), source, sent.message_id, "text")
     logger.info("sent message to user_id=%s message_id=%s", user_id, sent.message_id)
     return int(sent.message_id)
+
+
+async def copy_message_to_user(user_id: int, message: Message, source: str = "tg:reply") -> int:
+    if is_blocked(user_id):
+        raise ValueError(f"用户 {user_id} 已被封禁")
+    if not bot:
+        raise RuntimeError("Bot 尚未初始化")
+    sent = await message.copy_to(user_id)
+    message_id = int(getattr(sent, "message_id"))
+    create_outbox_message(
+        user_id,
+        message_log_text(message),
+        source,
+        message_id,
+        message_content_type(message),
+    )
+    logger.info(
+        "copied message to user_id=%s message_id=%s content_type=%s",
+        user_id,
+        message_id,
+        message_content_type(message),
+    )
+    return message_id
 
 
 def is_admin_chat(message: Message) -> bool:
@@ -1137,13 +1201,15 @@ def is_admin_action_message(message: Message) -> bool:
     """Only catch admin messages that are part of an action flow.
 
     A broad admin-chat handler would swallow ordinary admin messages before the
-    fallback handler. Keep it narrow: reply-to-user and /sendpic photo flow only.
+    fallback handler. Keep it narrow: reply-to-user and /sendpic flow only.
     """
     if not is_admin_chat(message):
         return False
     if pending_sendpic.get(message.chat.id):
         return True
-    return bool(message.reply_to_message and message.text)
+    if message.text and message.text.startswith("/"):
+        return False
+    return bool(message.reply_to_message)
 
 
 @router.message(Command("start"))
@@ -1341,7 +1407,14 @@ async def admin_reply_by_message(message: Message) -> None:
                     pending_sendpic.pop(message.chat.id, None)
                     await message.reply(f"错误：用户 {target} 已被封禁，先 /unblock {target}")
                     return
-                await bot.send_photo(target, message.photo[-1].file_id, caption=caption or None)  # type: ignore[union-attr]
+                sent = await bot.send_photo(target, message.photo[-1].file_id, caption=caption or None)  # type: ignore[union-attr]
+                create_outbox_message(
+                    target,
+                    caption or "[图片]",
+                    "tg:sendpic",
+                    int(sent.message_id),
+                    "photo",
+                )
                 pending_sendpic.pop(message.chat.id, None)
                 await message.reply(f"已发送图片给用户 {target}")
             except TelegramAPIError as e:
@@ -1354,7 +1427,7 @@ async def admin_reply_by_message(message: Message) -> None:
         return
 
     # Admin replies to forwarded/copy notification in admin chat.
-    if not message.reply_to_message or not message.text:
+    if not message.reply_to_message:
         return
     target = lookup_reply_target(message.chat.id, message.reply_to_message.message_id)
     if not target:
@@ -1363,8 +1436,10 @@ async def admin_reply_by_message(message: Message) -> None:
         if is_blocked(target):
             await message.reply(f"错误：用户 {target} 已被封禁，先 /unblock {target}")
             return
-        message_id = await send_text_to_user(target, message.text, "tg:reply")
-        await message.reply(f"已发送给用户 {target}，message_id={message_id}")
+        message_id = await copy_message_to_user(target, message, "tg:reply")
+        await message.reply(
+            f"已发送给用户 {target}，message_id={message_id}，类型={html_escape(message_content_type(message))}"
+        )
     except TelegramAPIError as e:
         logger.exception("admin reply forwarding failed")
         await message.reply(f"发送失败：{e}")
@@ -1378,7 +1453,7 @@ async def admin_plain_message(message: Message) -> None:
             "管理员普通消息不会自动转发。请使用：\n"
             "/send <user_id> <内容>\n"
             "/reply <user_id> <内容>\n"
-            "或在收件箱里回复某条用户消息；也可以打开面板的「主动发消息」。"
+            "或直接回复某条用户消息（支持文字/图片/文件等）；也可以打开面板的「主动发消息」。"
         )
 
 

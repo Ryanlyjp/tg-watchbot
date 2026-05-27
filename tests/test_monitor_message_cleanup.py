@@ -79,6 +79,7 @@ class FakeBot:
         self.deleted: list[tuple[int, int]] = []
         self.sent_texts: list[str] = []
         self.sent_chat_ids: list[int] = []
+        self.sent_photos: list[tuple[int, str, str | None]] = []
         self.fail_chat_ids: set[int] = set()
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
@@ -90,6 +91,10 @@ class FakeBot:
         self.sent_chat_ids.append(chat_id)
         self.sent_texts.append(text)
         return SimpleNamespace(message_id=3003)
+
+    async def send_photo(self, chat_id: int, file_id: str, caption: str | None = None):
+        self.sent_photos.append((chat_id, file_id, caption))
+        return SimpleNamespace(message_id=4004)
 
 
 class MonitorMessageCleanupTest(unittest.TestCase):
@@ -176,6 +181,20 @@ class MonitorMessageCleanupTest(unittest.TestCase):
             row = conn.execute("SELECT direction, source, text, forwarded FROM inbox_messages WHERE id=?", (outbox_id,)).fetchone()
         self.assertEqual(("out", "web:inbox", "reply text", 1), (row["direction"], row["source"], row["text"], row["forwarded"]))
 
+    def test_outbound_media_reply_is_recorded_with_message_type(self) -> None:
+        app.upsert_user(2001, "User", "user")
+        outbox_id = app.create_outbox_message(2001, "[图片]", "tg:reply", 5005, "photo")
+        with closing(sqlite3.connect(app.DB_PATH)) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT direction, source, text, forwarded, message_type FROM inbox_messages WHERE id=?",
+                (outbox_id,),
+            ).fetchone()
+        self.assertEqual(
+            ("out", "tg:reply", "[图片]", 1, "photo"),
+            (row["direction"], row["source"], row["text"], row["forwarded"], row["message_type"]),
+        )
+
     def test_save_message_map_supports_message_id_only_payload(self) -> None:
         app.save_message_map(1001, 3003, 2001, 4004)
         with closing(sqlite3.connect(app.DB_PATH)) as conn:
@@ -207,6 +226,110 @@ class MonitorMessageCleanupTest(unittest.TestCase):
         with closing(sqlite3.connect(app.DB_PATH)) as conn:
             remaining = conn.execute("SELECT COUNT(*) FROM monitor_messages").fetchone()[0]
         self.assertEqual(1, remaining)
+
+    def test_copy_message_to_user_records_media_log(self) -> None:
+        old_bot = app.bot
+        app.upsert_user(2001, "User", "user")
+
+        class FakeMediaMessage:
+            content_type = "photo"
+            text = None
+            caption = "证件照"
+
+            async def copy_to(self, user_id: int):
+                self.copied_user_id = user_id
+                return SimpleNamespace(message_id=6006)
+
+        message = FakeMediaMessage()
+        app.bot = object()
+        try:
+            message_id = asyncio.run(app.copy_message_to_user(2001, message, "tg:reply"))
+            self.assertEqual(6006, message_id)
+            self.assertEqual(2001, message.copied_user_id)
+            with closing(sqlite3.connect(app.DB_PATH)) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    "SELECT source, text, message_type, user_message_id FROM inbox_messages WHERE direction='out' ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            self.assertEqual(("tg:reply", "证件照", "photo", 6006), (row["source"], row["text"], row["message_type"], row["user_message_id"]))
+        finally:
+            app.bot = old_bot
+
+    def test_admin_reply_by_message_supports_media_reply(self) -> None:
+        old_bot = app.bot
+        old_admin_chat_ids = app.admin_chat_ids
+        app.upsert_user(2001, "User", "user")
+        app.save_message_map(1001, 3003, 2001, 4004)
+
+        class FakeAdminReply:
+            def __init__(self) -> None:
+                self.chat = SimpleNamespace(id=1001)
+                self.reply_to_message = SimpleNamespace(message_id=3003)
+                self.text = None
+                self.caption = "资料图"
+                self.content_type = "photo"
+                self.replies: list[str] = []
+
+            async def copy_to(self, user_id: int):
+                self.copied_user_id = user_id
+                return SimpleNamespace(message_id=7007)
+
+            async def reply(self, text: str):
+                self.replies.append(text)
+
+        message = FakeAdminReply()
+        app.bot = object()
+        app.admin_chat_ids = [1001]
+        try:
+            asyncio.run(app.admin_reply_by_message(message))
+            self.assertEqual(2001, message.copied_user_id)
+            self.assertTrue(message.replies)
+            self.assertIn("类型=photo", message.replies[0])
+            with closing(sqlite3.connect(app.DB_PATH)) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    "SELECT source, text, message_type, user_message_id FROM inbox_messages WHERE direction='out' ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            self.assertEqual(("tg:reply", "资料图", "photo", 7007), (row["source"], row["text"], row["message_type"], row["user_message_id"]))
+        finally:
+            app.bot = old_bot
+            app.admin_chat_ids = old_admin_chat_ids
+
+    def test_sendpic_flow_records_photo_reply(self) -> None:
+        old_bot = app.bot
+        old_pending_sendpic = app.pending_sendpic
+        old_admin_chat_ids = app.admin_chat_ids
+        app.upsert_user(2001, "User", "user")
+        fake_bot = FakeBot()
+        app.bot = fake_bot
+        app.admin_chat_ids = [1001]
+        app.pending_sendpic = {1001: {"target": 2001, "caption": "图片备注", "created_at": 9999999999}}
+
+        class FakePhotoMessage:
+            def __init__(self) -> None:
+                self.chat = SimpleNamespace(id=1001)
+                self.text = None
+                self.caption = None
+                self.photo = [SimpleNamespace(file_id="file-1")]
+                self.reply_messages: list[str] = []
+
+            async def reply(self, text: str):
+                self.reply_messages.append(text)
+
+        message = FakePhotoMessage()
+        try:
+            asyncio.run(app.admin_reply_by_message(message))
+            self.assertEqual([(2001, "file-1", "图片备注")], fake_bot.sent_photos)
+            with closing(sqlite3.connect(app.DB_PATH)) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    "SELECT source, text, message_type, user_message_id FROM inbox_messages WHERE direction='out' ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            self.assertEqual(("tg:sendpic", "图片备注", "photo", 4004), (row["source"], row["text"], row["message_type"], row["user_message_id"]))
+        finally:
+            app.bot = old_bot
+            app.pending_sendpic = old_pending_sendpic
+            app.admin_chat_ids = old_admin_chat_ids
 
 
 class BotConfigurationTest(unittest.TestCase):
