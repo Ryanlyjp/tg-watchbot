@@ -1143,6 +1143,12 @@ def message_log_text(message: Message) -> str:
     text = str(getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
     if text:
         return text
+    return stored_message_preview("", message_content_type(message))
+
+
+def stored_message_preview(text: str | None, message_type: str | None) -> str:
+    if str(text or "").strip():
+        return str(text).strip()
     labels = {
         "photo": "[图片]",
         "video": "[视频]",
@@ -1155,7 +1161,7 @@ def message_log_text(message: Message) -> str:
         "location": "[位置]",
         "contact": "[联系人]",
     }
-    return labels.get(message_content_type(message), "(非文本/媒体消息)")
+    return labels.get(str(message_type or "message"), "(非文本/媒体消息)")
 
 
 async def send_text_to_user(user_id: int, text: str, source: str = "web") -> int:
@@ -2964,6 +2970,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         for r in rows:
             direction = r["direction"] if "direction" in r.keys() else "in"
             source = r["source"] if "source" in r.keys() else "user"
+            message_type = r["message_type"] if "message_type" in r.keys() else "message"
             if direction == "out":
                 status_txt, status_cls = "已回复", "ok"
             elif (r["error"] or "").startswith("spam:"):
@@ -2971,12 +2978,12 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
             else:
                 status_txt = "已转发" if r["forwarded"] else "未转发"
                 status_cls = "ok" if r["forwarded"] else "danger"
-            content = html_escape(r["text"] or "(非文本/媒体消息)")
+            content = html_escape(stored_message_preview(r["text"], message_type))
             flow = "用户 -> 管理员" if direction == "in" else "管理员 -> 用户"
             actions = f"<a class=btn href='/inbox/{r['id']}/reply'>回复</a>"
             if direction == "in" and not r["forwarded"]:
                 actions += f" <a class=btn href='/inbox/{r['id']}/retry'>重试转发</a>"
-            trs.append(f"""<tr><td>#{r['id']}<br><span class='badge {status_cls}'>{status_txt}</span></td><td><b>{html_escape(r['full_name'])}</b><br><small>{r['user_id']} @{html_escape(r['username'] or '')}</small></td><td>{html_escape(flow)}<br><small>{html_escape(source)} · {html_escape(r['created_at'])}</small></td><td>{content}<br><small style='color:#fca5a5'>{html_escape(r['error'] or '')}</small></td><td>{actions}</td></tr>""")
+            trs.append(f"""<tr><td>#{r['id']}<br><span class='badge {status_cls}'>{status_txt}</span></td><td><b>{html_escape(r['full_name'])}</b><br><small>{r['user_id']} @{html_escape(r['username'] or '')}</small></td><td>{html_escape(flow)}<br><small>{html_escape(source)} · {html_escape(message_type)} · {html_escape(r['created_at'])}</small></td><td>{content}<br><small style='color:#fca5a5'>{html_escape(r['error'] or '')}</small></td><td>{actions}</td></tr>""")
         body = "<div class=card><h2>收件箱</h2><p class=muted>这里显示双向机器人对话记录：用户发来的消息、Web 回复、TG 管理员回复都会记录。转发失败的入站消息可重试。</p><table><tr><th>ID/状态</th><th>用户</th><th>方向/来源</th><th>内容/错误</th><th>操作</th></tr>" + "".join(trs) + "</table></div>"
         return layout("收件箱", body)
 
@@ -2993,11 +3000,15 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         row = get_inbox_message(msg_id)
         if not row:
             raise HTTPException(404, "message not found")
+        preview = stored_message_preview(
+            row["text"] if "text" in row.keys() else "",
+            row["message_type"] if "message_type" in row.keys() else "message",
+        )
         options = "".join(
             f"<option value='{html_escape(r.get('text',''))}'>{html_escape(r.get('title',''))}</option>"
             for r in list_quick_replies()
         )
-        body = f"""<div class=card><h2>回复用户</h2><p class=muted>#{row['id']} · {html_escape(row['full_name'])} · {row['user_id']}</p><pre>{html_escape(row['text'] or '(非文本/媒体消息)')}</pre><form method=post>
+        body = f"""<div class=card><h2>回复用户</h2><p class=muted>#{row['id']} · {html_escape(row['full_name'])} · {row['user_id']} · {html_escape(row['message_type'] or 'message')}</p><pre>{html_escape(preview)}</pre><form method=post>
 <label>快捷模板</label><select onchange="if(this.value)document.querySelector('[name=text]').value=this.value"><option value=''>选择模板</option>{options}</select>
 <label>回复内容</label><textarea name=text required></textarea>
 <div class=form-actions><button class='btn primary' type=submit>发送回复</button> <a class=btn href='/inbox'>返回</a></div></form></div>"""
