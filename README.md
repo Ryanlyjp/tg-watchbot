@@ -15,7 +15,7 @@
 ## 简介：
 tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器人** 和 **Web/RSS 监控推送** 合在一起：
 
-- 普通用户私聊 Bot，消息会转发给管理员；
+- 普通用户私聊 Bot，消息会转发给管理员，或转发到私有超级群的 Forum Topic；
 - 管理员可以直接回复、主动发文字/图片、并通过“回复用户消息”回传文字、图片、文件、视频等常见媒体；
 - 后台定时监控 RSS 或网页，命中关键词、新条目、价格/库存变化后推送给管理员；
 - 自带一个 Web 管理面板，可配置监控目标、编辑 YAML、查看收件箱和日志。
@@ -25,7 +25,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 
 ## AI 一句话安装
 ```
-请克隆 `https://github.com/GongyiChuren/tg-watchbot.git` 到本机，默认使用 Docker 按 README 的 `Docker 安装（含自启）` 启动服务；若无 Docker，则按 `快速开始` 走 Python 和 systemd 部署直接安装。启动后打开 `http://127.0.0.1:8765`，安装完成后提醒用户记得在面板填写 `TELEGRAM_BOT_TOKEN` 和 `ADMIN_CHAT_ID` 并在之后保存并执行重启（Docker 用 `docker compose restart`，直接安装用重启进程）。
+请克隆 `https://github.com/GongyiChuren/tg-watchbot.git` 到本机，默认使用 Docker 按 README 的 `Docker 安装（含自启）` 启动服务；若无 Docker，则按 `快速开始` 走 Python 和 systemd 部署直接安装。启动后打开 `http://127.0.0.1:8765`，安装完成后提醒用户记得在面板填写 `TELEGRAM_BOT_TOKEN`，然后二选一：`direct` 模式填写 `ADMIN_CHAT_ID`，或 `forum_topic` 模式填写 `ADMIN_FORUM_GROUP_ID`；保存后执行重启（Docker 用 `docker compose restart`，直接安装用重启进程）。
 ``` 
 ## 更新日志
 
@@ -66,6 +66,9 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - `/start` 建立用户和管理员之间的联系。
 - 用户消息先写入 SQLite，再转发给管理员，避免转发失败时丢消息。
 - 管理员可通过“回复转发消息”直接回给原用户；回复时支持文字、图片、文件、视频、语音、贴纸、位置、联系人等常见内容。
+- 支持两种管理员路由：
+  - `direct`：转发到管理员私聊 / 小群，适合轻量使用；
+  - `forum_topic`：转发到私有超级群 Topic，一个用户一个线程，适合大群工单式处理。
 - 支持显式命令：
   - `/reply <user_id> <内容>`：给指定用户发文字；
   - `/sendpic <user_id> [说明]`：给指定用户发图片；
@@ -79,6 +82,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
   - `/cancel`：取消待发送图片。
 - 普通用户有简单限流，防止刷屏。
 - 支持最多 3 个管理员 chat id，用逗号分隔配置。
+- `forum_topic` 模式下可只配置一个私有超级群 `ADMIN_FORUM_GROUP_ID`；用户仍然私聊 Bot，不需要加入群。
 - 支持私聊广告关键词自动拦截和自动拉黑，不影响 RSS/Web 监控。
 
 ![示例图片](https://pic.gongyichuren.de/file/1779287173835_8521cab29a9635743a603582ceb7ba02.png)
@@ -300,7 +304,9 @@ curl http://127.0.0.1:8765/health
 | 变量 | 说明 |
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | BotFather 创建的 Telegram Bot Token |
-| `ADMIN_CHAT_ID` | 管理员 Telegram 数字 chat id；最多 3 个，用逗号分隔 |
+| `ADMIN_CHAT_ID` | `direct` 模式下的管理员 Telegram 数字 chat id；最多 3 个，用逗号分隔 |
+| `ADMIN_ROUTE_MODE` | 管理员路由模式：`direct` 或 `forum_topic` |
+| `ADMIN_FORUM_GROUP_ID` | `forum_topic` 模式下的私有超级群 ID，Bot 需要在群里且已开启 Topics |
 | `LOG_LEVEL` | 日志级别，默认 `INFO` |
 | `WEB_PANEL_ENABLED` | 是否启用 Web 面板，默认 `true` |
 | `WEB_PANEL_HOST` | 面板监听地址，默认 `127.0.0.1` |

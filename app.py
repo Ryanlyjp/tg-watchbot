@@ -75,7 +75,7 @@ admin_chat_id: int | None = None
 admin_chat_ids: list[int] = []
 config: dict[str, Any] = {}
 rate_buckets: dict[int, list[float]] = {}
-pending_sendpic: dict[int, dict[str, Any]] = {}
+pending_sendpic: dict[str, dict[str, Any]] = {}
 scheduler_ref: AsyncIOScheduler | None = None
 user_session_listener_task: asyncio.Task | None = None
 user_session_client: Any = None
@@ -230,6 +230,16 @@ def init_db() -> None:
                 last_seen_at TEXT NOT NULL,
                 active INTEGER DEFAULT 1
             );
+            CREATE TABLE IF NOT EXISTS forum_topics (
+                user_id INTEGER PRIMARY KEY,
+                admin_chat_id INTEGER NOT NULL,
+                message_thread_id INTEGER NOT NULL,
+                topic_name TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_forum_topics_chat_thread
+            ON forum_topics(admin_chat_id, message_thread_id);
             """
         )
         for sql in [
@@ -315,6 +325,72 @@ def parse_admin_chat_ids(raw: str) -> list[int]:
     return list(dict.fromkeys(ids))[:3]
 
 
+def admin_route_mode() -> str:
+    load_dotenv(ENV_PATH, override=True)
+    mode = os.getenv("ADMIN_ROUTE_MODE", "direct").strip().lower()
+    return mode if mode in {"direct", "forum_topic"} else "direct"
+
+
+def parse_optional_chat_id(raw: str) -> int | None:
+    value = (raw or "").strip()
+    if not value:
+        return None
+    return int(value)
+
+
+def admin_forum_group_id() -> int | None:
+    load_dotenv(ENV_PATH, override=True)
+    raw = os.getenv("ADMIN_FORUM_GROUP_ID", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def forum_topic_enabled() -> bool:
+    return admin_route_mode() == "forum_topic" and admin_forum_group_id() is not None
+
+
+def admin_notification_chat_ids() -> list[int]:
+    if admin_chat_ids:
+        return list(dict.fromkeys(admin_chat_ids[:3]))
+    if admin_chat_id is not None:
+        return [admin_chat_id]
+    group_id = admin_forum_group_id() if forum_topic_enabled() else None
+    return [group_id] if group_id is not None else []
+
+
+def relay_admin_chat_ids() -> list[int]:
+    if forum_topic_enabled():
+        group_id = admin_forum_group_id()
+        return [group_id] if group_id is not None else []
+    return admin_notification_chat_ids()
+
+
+def recognized_admin_chat_ids() -> list[int]:
+    ids = admin_notification_chat_ids()
+    group_id = admin_forum_group_id() if forum_topic_enabled() else None
+    if group_id is not None:
+        ids.append(group_id)
+    return list(dict.fromkeys(ids))
+
+
+def message_thread_id(message: Message) -> int:
+    return int(getattr(message, "message_thread_id", 0) or 0)
+
+
+def is_forum_admin_chat(message: Message) -> bool:
+    group_id = admin_forum_group_id()
+    return forum_topic_enabled() and group_id is not None and int(message.chat.id) == int(group_id)
+
+
+def admin_context_key(message: Message) -> str:
+    sender_id = int(getattr(getattr(message, "from_user", None), "id", 0) or 0)
+    return f"{int(message.chat.id)}:{message_thread_id(message)}:{sender_id}"
+
+
 def set_note(user_id: int, note: str) -> None:
     with closing(db()) as conn:
         conn.execute("UPDATE users SET note=?, updated_at=? WHERE user_id=?", (note, now_iso(), user_id))
@@ -339,6 +415,59 @@ def save_message_map(admin_chat_id: int, admin_message_id: int, user_id: int, us
             (admin_chat_id, admin_message_id, user_id, user_message_id, now_iso()),
         )
         conn.commit()
+
+
+def get_forum_topic_by_user(user_id: int) -> sqlite3.Row | None:
+    with closing(db()) as conn:
+        return conn.execute("SELECT * FROM forum_topics WHERE user_id=?", (user_id,)).fetchone()
+
+
+def get_forum_topic_by_thread(admin_chat_id: int, thread_id: int) -> sqlite3.Row | None:
+    with closing(db()) as conn:
+        return conn.execute(
+            "SELECT * FROM forum_topics WHERE admin_chat_id=? AND message_thread_id=?",
+            (admin_chat_id, thread_id),
+        ).fetchone()
+
+
+def save_forum_topic(user_id: int, admin_chat_id: int, thread_id: int, topic_name: str) -> None:
+    with closing(db()) as conn:
+        conn.execute(
+            """
+            INSERT INTO forum_topics(user_id, admin_chat_id, message_thread_id, topic_name, created_at, updated_at)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                admin_chat_id=excluded.admin_chat_id,
+                message_thread_id=excluded.message_thread_id,
+                topic_name=excluded.topic_name,
+                updated_at=excluded.updated_at
+            """,
+            (user_id, admin_chat_id, thread_id, topic_name, now_iso(), now_iso()),
+        )
+        conn.commit()
+
+
+def build_forum_topic_name(user_id: int, full_name: str, username: str | None) -> str:
+    display = " ".join(x for x in [full_name.strip(), f"@{username}" if username else ""] if x).strip()
+    base = display or str(user_id)
+    base = re.sub(r"\s+", " ", base).replace("\n", " ").replace("\r", " ").strip()
+    return f"{base[:48]} | {user_id}"[:120]
+
+
+async def create_or_get_forum_topic(user_id: int, full_name: str, username: str | None) -> tuple[int, bool]:
+    group_id = admin_forum_group_id()
+    if group_id is None:
+        raise RuntimeError("ADMIN_FORUM_GROUP_ID 未配置")
+    existing = get_forum_topic_by_user(user_id)
+    if existing and int(existing["admin_chat_id"]) == int(group_id):
+        return int(existing["message_thread_id"]), False
+    if not bot:
+        raise RuntimeError("Bot 尚未初始化")
+    topic_name = build_forum_topic_name(user_id, full_name, username)
+    topic = await bot.create_forum_topic(chat_id=group_id, name=topic_name)  # type: ignore[union-attr]
+    thread_id = int(getattr(topic, "message_thread_id"))
+    save_forum_topic(user_id, group_id, thread_id, topic_name)
+    return thread_id, True
 
 
 
@@ -1070,6 +1199,11 @@ def lookup_reply_target(admin_chat: int, admin_message_id: int) -> int | None:
         return int(row["user_id"]) if row else None
 
 
+def lookup_forum_thread_target(admin_chat_id: int, thread_id: int) -> int | None:
+    row = get_forum_topic_by_thread(admin_chat_id, thread_id)
+    return int(row["user_id"]) if row else None
+
+
 def parse_user_id_and_text(args: str | None) -> tuple[int, str]:
     if not args:
         raise ValueError("缺少参数")
@@ -1104,10 +1238,11 @@ def describe_sendpic_target(user_id: int) -> str:
 
 
 async def admin_send(text: str) -> None:
-    if not bot or not all_admin_chat_ids():
+    targets = admin_notification_chat_ids()
+    if not bot or not targets:
         logger.error("admin_send called before bot/admin init: %s", text)
         return
-    for chat_id in all_admin_chat_ids():
+    for chat_id in targets:
         try:
             await bot.send_message(chat_id, text, disable_web_page_preview=False)
         except Exception:
@@ -1115,11 +1250,12 @@ async def admin_send(text: str) -> None:
 
 
 async def admin_send_monitor(text: str, monitor_name: str) -> bool:
-    if not bot or not all_admin_chat_ids():
+    targets = admin_notification_chat_ids()
+    if not bot or not targets:
         logger.error("admin_send_monitor called before bot/admin init: %s", text)
         return False
     sent_any = False
-    for chat_id in all_admin_chat_ids():
+    for chat_id in targets:
         try:
             sent = await bot.send_message(chat_id, text, disable_web_page_preview=False)
             settings = monitor_cleanup_settings()
@@ -1200,7 +1336,7 @@ async def copy_message_to_user(user_id: int, message: Message, source: str = "tg
 
 def is_admin_chat(message: Message) -> bool:
     """Dynamic admin-chat filter."""
-    return message.chat.id in all_admin_chat_ids()
+    return message.chat.id in recognized_admin_chat_ids()
 
 
 def is_admin_action_message(message: Message) -> bool:
@@ -1211,10 +1347,12 @@ def is_admin_action_message(message: Message) -> bool:
     """
     if not is_admin_chat(message):
         return False
-    if pending_sendpic.get(message.chat.id):
+    if pending_sendpic.get(admin_context_key(message)):
         return True
     if message.text and message.text.startswith("/"):
         return False
+    if is_forum_admin_chat(message) and message_thread_id(message):
+        return True
     return bool(message.reply_to_message)
 
 
@@ -1273,7 +1411,7 @@ async def cmd_sendpic(message: Message, command: CommandObject) -> None:
         if is_blocked(uid):
             await message.reply(f"错误：用户 {uid} 已被封禁，先 /unblock {uid}")
             return
-        pending_sendpic[message.chat.id] = {"target": uid, "caption": caption, "created_at": time.time()}
+        pending_sendpic[admin_context_key(message)] = {"target": uid, "caption": caption, "created_at": time.time()}
         suffix = f"\n说明文字：{caption}" if caption else ""
         await message.reply(
             f"请发送需要转发给 {uid}（{html_escape(describe_sendpic_target(uid))}）的图片。{suffix}\n"
@@ -1286,7 +1424,7 @@ async def cmd_sendpic(message: Message, command: CommandObject) -> None:
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message) -> None:
-    if is_admin_chat(message) and pending_sendpic.pop(message.chat.id, None):
+    if is_admin_chat(message) and pending_sendpic.pop(admin_context_key(message), None):
         await message.reply("已取消待发送图片。")
 
 
@@ -1399,10 +1537,11 @@ async def cmd_spamdel(message: Message, command: CommandObject) -> None:
 @router.message(is_admin_action_message)
 async def admin_reply_by_message(message: Message) -> None:
     # Pending /sendpic flow: after /sendpic <uid>, the next admin photo is copied to target.
-    pending = pending_sendpic.get(message.chat.id)
+    pending_key = admin_context_key(message)
+    pending = pending_sendpic.get(pending_key)
     if pending:
         if time.time() - float(pending.get("created_at", 0)) > 120:
-            pending_sendpic.pop(message.chat.id, None)
+            pending_sendpic.pop(pending_key, None)
             await message.reply("发送图片超时，已取消。请重新使用 /sendpic 用户ID。")
             return
         if message.photo:
@@ -1410,7 +1549,7 @@ async def admin_reply_by_message(message: Message) -> None:
             caption = (message.caption or pending.get("caption") or "")[:1024]
             try:
                 if is_blocked(target):
-                    pending_sendpic.pop(message.chat.id, None)
+                    pending_sendpic.pop(pending_key, None)
                     await message.reply(f"错误：用户 {target} 已被封禁，先 /unblock {target}")
                     return
                 sent = await bot.send_photo(target, message.photo[-1].file_id, caption=caption or None)  # type: ignore[union-attr]
@@ -1421,7 +1560,7 @@ async def admin_reply_by_message(message: Message) -> None:
                     int(sent.message_id),
                     "photo",
                 )
-                pending_sendpic.pop(message.chat.id, None)
+                pending_sendpic.pop(pending_key, None)
                 await message.reply(f"已发送图片给用户 {target}")
             except TelegramAPIError as e:
                 logger.exception("/sendpic photo forwarding failed")
@@ -1433,9 +1572,13 @@ async def admin_reply_by_message(message: Message) -> None:
         return
 
     # Admin replies to forwarded/copy notification in admin chat.
-    if not message.reply_to_message:
+    if message.text and message.text.startswith("/"):
         return
-    target = lookup_reply_target(message.chat.id, message.reply_to_message.message_id)
+    target: int | None = None
+    if message.reply_to_message:
+        target = lookup_reply_target(message.chat.id, message.reply_to_message.message_id)
+    if target is None and is_forum_admin_chat(message) and message_thread_id(message):
+        target = lookup_forum_thread_target(int(message.chat.id), message_thread_id(message))
     if not target:
         return
     try:
@@ -1459,7 +1602,7 @@ async def admin_plain_message(message: Message) -> None:
             "管理员普通消息不会自动转发。请使用：\n"
             "/send <user_id> <内容>\n"
             "/reply <user_id> <内容>\n"
-            "或直接回复某条用户消息（支持文字/图片/文件等）；也可以打开面板的「主动发消息」。"
+            "或直接回复某条用户消息（支持文字/图片/文件等）。若已启用 Forum 模式，也可以在用户 Topic 内直接发消息；也可以打开面板的「主动发消息」。"
         )
 
 
@@ -1512,13 +1655,25 @@ async def user_message(message: Message) -> None:
     try:
         first_header_id = None
         first_copy_id = None
-        for chat_id in all_admin_chat_ids():
-            sent = await bot.send_message(chat_id, header)  # type: ignore[union-attr]
-            save_message_map(chat_id, sent.message_id, uid, message.message_id)
-            copied = await message.copy_to(chat_id, reply_to_message_id=sent.message_id)  # type: ignore[arg-type]
-            save_message_map(chat_id, copied.message_id, uid, message.message_id)
-            first_header_id = first_header_id or sent.message_id
-            first_copy_id = first_copy_id or copied.message_id
+        if forum_topic_enabled():
+            group_id = admin_forum_group_id()
+            if group_id is None:
+                raise RuntimeError("ADMIN_FORUM_GROUP_ID 未配置")
+            thread_id, _ = await create_or_get_forum_topic(uid, full, username)
+            sent = await bot.send_message(group_id, header, message_thread_id=thread_id)  # type: ignore[union-attr]
+            save_message_map(group_id, sent.message_id, uid, message.message_id)
+            copied = await message.copy_to(group_id, reply_to_message_id=sent.message_id, message_thread_id=thread_id)  # type: ignore[arg-type]
+            save_message_map(group_id, copied.message_id, uid, message.message_id)
+            first_header_id = sent.message_id
+            first_copy_id = copied.message_id
+        else:
+            for chat_id in relay_admin_chat_ids():
+                sent = await bot.send_message(chat_id, header)  # type: ignore[union-attr]
+                save_message_map(chat_id, sent.message_id, uid, message.message_id)
+                copied = await message.copy_to(chat_id, reply_to_message_id=sent.message_id)  # type: ignore[arg-type]
+                save_message_map(chat_id, copied.message_id, uid, message.message_id)
+                first_header_id = first_header_id or sent.message_id
+                first_copy_id = first_copy_id or copied.message_id
         mark_inbox_forwarded(inbox_id, first_header_id, first_copy_id)
         await message.answer("已转交管理员。")
     except Exception as e:
@@ -1876,7 +2031,7 @@ async def cleanup_monitor_loop() -> None:
 
 
 async def flush_pending_inbox() -> None:
-    if not bot or not all_admin_chat_ids():
+    if not bot or not relay_admin_chat_ids():
         return
     rows = pending_inbox(50)
     if not rows:
@@ -1895,10 +2050,23 @@ async def flush_pending_inbox() -> None:
                 f"内容：{html_escape(row['text'] or '(非文本/媒体消息，原始媒体无法补发，仅保留记录)')}"
             )
             first_id = None
-            for chat_id in all_admin_chat_ids():
-                sent = await bot.send_message(chat_id, text)
-                save_message_map(chat_id, sent.message_id, int(row['user_id']), int(row['user_message_id']) if row['user_message_id'] else None)
-                first_id = first_id or sent.message_id
+            if forum_topic_enabled():
+                group_id = admin_forum_group_id()
+                if group_id is None:
+                    raise RuntimeError("ADMIN_FORUM_GROUP_ID 未配置")
+                thread_id, _ = await create_or_get_forum_topic(
+                    int(row["user_id"]),
+                    str(row["full_name"] or row["user_id"]),
+                    str(row["username"] or "") or None,
+                )
+                sent = await bot.send_message(group_id, text, message_thread_id=thread_id)
+                save_message_map(group_id, sent.message_id, int(row['user_id']), int(row['user_message_id']) if row['user_message_id'] else None)
+                first_id = sent.message_id
+            else:
+                for chat_id in relay_admin_chat_ids():
+                    sent = await bot.send_message(chat_id, text)
+                    save_message_map(chat_id, sent.message_id, int(row['user_id']), int(row['user_message_id']) if row['user_message_id'] else None)
+                    first_id = first_id or sent.message_id
             mark_inbox_forwarded(int(row['id']), first_id, None)
         except Exception as e:
             mark_inbox_error(int(row['id']), repr(e))
@@ -2013,6 +2181,8 @@ def env_values() -> dict[str, str]:
     return {
         "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
         "ADMIN_CHAT_ID": os.getenv("ADMIN_CHAT_ID", ""),
+        "ADMIN_ROUTE_MODE": os.getenv("ADMIN_ROUTE_MODE", "direct"),
+        "ADMIN_FORUM_GROUP_ID": os.getenv("ADMIN_FORUM_GROUP_ID", ""),
         "LOG_LEVEL": os.getenv("LOG_LEVEL", "INFO"),
         "WEB_PANEL_ENABLED": os.getenv("WEB_PANEL_ENABLED", "true"),
         "WEB_PANEL_HOST": os.getenv("WEB_PANEL_HOST", "127.0.0.1"),
@@ -2038,6 +2208,8 @@ def write_env_values(values: dict[str, str]) -> None:
         "# tg-watchbot environment",
         f"TELEGRAM_BOT_TOKEN={values.get('TELEGRAM_BOT_TOKEN','')}",
         f"ADMIN_CHAT_ID={values.get('ADMIN_CHAT_ID','')}",
+        f"ADMIN_ROUTE_MODE={values.get('ADMIN_ROUTE_MODE','direct')}",
+        f"ADMIN_FORUM_GROUP_ID={values.get('ADMIN_FORUM_GROUP_ID','')}",
         f"LOG_LEVEL={values.get('LOG_LEVEL','INFO')}",
         "",
         "# Web 管理面板；默认只监听本机，建议用 SSH 隧道或反代再暴露",
@@ -2883,11 +3055,12 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
     async def settings(_: str = Depends(panel_auth)) -> str:
         v = env_values()
         cleanup = (cfg_load_fresh().get("cleanup") or {})
-        bot_ready = bool(v["TELEGRAM_BOT_TOKEN"].strip() and v["ADMIN_CHAT_ID"].strip())
-        status = "" if bot_ready else "<div class=msg>未填写 Token 或管理员 ID；网页可用，但 Bot 和监控推送不可用。</div>"
+        bot_ready = bot_env_configured()
+        status = "" if bot_ready else "<div class=msg>未完成 Bot 配置；网页可用，但 Bot 和监控推送不可用。direct 模式需要 ADMIN_CHAT_ID，forum_topic 模式需要 ADMIN_FORUM_GROUP_ID。</div>"
         body = f"""<h2>Bot / 面板设置</h2>{status}<div class=card><form method=post>
 <label>Telegram Bot Token</label><input name=TELEGRAM_BOT_TOKEN value='{html_escape(v['TELEGRAM_BOT_TOKEN'])}' placeholder='123456:ABC...'>
-<label>管理员 ADMIN_CHAT_ID（最多 3 个，用逗号分隔）</label><input name=ADMIN_CHAT_ID value='{html_escape(v['ADMIN_CHAT_ID'])}'>
+<div class=grid><div><label>管理员路由模式</label><select name=ADMIN_ROUTE_MODE><option value='direct' {'selected' if v['ADMIN_ROUTE_MODE'] == 'direct' else ''}>direct 直发管理员</option><option value='forum_topic' {'selected' if v['ADMIN_ROUTE_MODE'] == 'forum_topic' else ''}>forum_topic 私有超级群 Topic</option></select></div><div><label>管理员 ADMIN_CHAT_ID</label><input name=ADMIN_CHAT_ID value='{html_escape(v['ADMIN_CHAT_ID'])}' placeholder='直发模式可填最多 3 个，逗号分隔'></div></div>
+<label>ADMIN_FORUM_GROUP_ID（私有超级群 ID）</label><input name=ADMIN_FORUM_GROUP_ID value='{html_escape(v['ADMIN_FORUM_GROUP_ID'])}' placeholder='forum_topic 模式必填，例如 -1001234567890'>
 <h3>TG 用户会话（可选）</h3><p class=muted>仅用于“TG 群监听 -> 监听来源=用户会话”，适合 Bot 无法加入的群。填写后需重启。</p>
 <div class=grid><div><label>TG_API_ID</label><input name=TG_API_ID value='{html_escape(v['TG_API_ID'])}' placeholder='例如 12345678'></div><div><label>TG_API_HASH</label><input name=TG_API_HASH value='{html_escape(v['TG_API_HASH'])}' placeholder='32位哈希'></div></div>
 <label>TG_API_SESSION</label><textarea name=TG_API_SESSION placeholder='Telethon StringSession'>{html_escape(v['TG_API_SESSION'])}</textarea>
@@ -2913,7 +3086,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         cfg_save(cfg)
 
     @app.post("/settings", response_class=HTMLResponse)
-    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440)) -> str:
+    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), ADMIN_ROUTE_MODE: str = Form("direct"), ADMIN_FORUM_GROUP_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440)) -> str:
         save_panel_settings(locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED}, CLEANUP_INTERVAL_MINUTES, CLEANUP_MESSAGE_DELETE_AFTER_MINUTES, CLEANUP_RETENTION_MINUTES)
         return layout("已保存", "<div class=msg>已保存，不会自动重启；修改 Token/管理员 ID 后请重启。</div><p><a class=btn href='/settings'>返回</a> <a class=btn href='/restart'>重启机器人</a></p>")
 
@@ -3039,7 +3212,8 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
             trs.append(f"""<tr><td><b>{html_escape(u['full_name'] or u['user_id'])}</b><br><small>{u['user_id']} @{html_escape(u['username'] or '')}</small></td><td><span class=badge>{status_txt}</span><br><small>{html_escape(u['updated_at'])}</small></td><td>{html_escape(u['note'] or '')}</td><td><form method=post action='/users/{u['user_id']}/note'><input name=note value='{html_escape(u['note'] or '')}'><button class=btn type=submit>备注</button></form><div class=actions><a class=btn href='/send?user_id={u['user_id']}'>发消息</a><a class='btn danger' href='/users/{u['user_id']}/{action}'>{action_txt}</a></div></td></tr>""")
         settings_card = f"""<div class=card><h2>Bot / 面板配置</h2><p class=muted>这里和“Bot / 面板设置”共用同一份 .env。修改 Token、管理员 ID、端口、账号或密码后不会自动重启，需要手动重启服务。</p><form method=post action='/users/settings'>
 <label>Telegram Bot Token</label><input name=TELEGRAM_BOT_TOKEN value='{html_escape(v['TELEGRAM_BOT_TOKEN'])}' placeholder='123456:ABC...'>
-<label>管理员 ADMIN_CHAT_ID（最多 3 个，用逗号分隔）</label><input name=ADMIN_CHAT_ID value='{html_escape(v['ADMIN_CHAT_ID'])}'>
+<div class=grid><div><label>管理员路由模式</label><select name=ADMIN_ROUTE_MODE><option value='direct' {'selected' if v['ADMIN_ROUTE_MODE'] == 'direct' else ''}>direct 直发管理员</option><option value='forum_topic' {'selected' if v['ADMIN_ROUTE_MODE'] == 'forum_topic' else ''}>forum_topic 私有超级群 Topic</option></select></div><div><label>管理员 ADMIN_CHAT_ID</label><input name=ADMIN_CHAT_ID value='{html_escape(v['ADMIN_CHAT_ID'])}'></div></div>
+<label>ADMIN_FORUM_GROUP_ID（私有超级群 ID）</label><input name=ADMIN_FORUM_GROUP_ID value='{html_escape(v['ADMIN_FORUM_GROUP_ID'])}'>
 <h3>TG 用户会话（可选）</h3><p class=muted>仅用于 TG 群监听来源=用户会话。修改后需重启。</p>
 <div class=grid><div><label>TG_API_ID</label><input name=TG_API_ID value='{html_escape(v['TG_API_ID'])}'></div><div><label>TG_API_HASH</label><input name=TG_API_HASH value='{html_escape(v['TG_API_HASH'])}'></div></div>
 <label>TG_API_SESSION</label><textarea name=TG_API_SESSION>{html_escape(v['TG_API_SESSION'])}</textarea>
@@ -3049,7 +3223,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         return layout("用户管理", body)
 
     @app.post("/users/settings", response_class=HTMLResponse)
-    async def users_settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin")) -> str:
+    async def users_settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), ADMIN_ROUTE_MODE: str = Form("direct"), ADMIN_FORUM_GROUP_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin")) -> str:
         cleanup = (cfg_load_fresh().get("cleanup") or {})
         save_panel_settings(
             locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED},
@@ -3285,17 +3459,25 @@ def validate_env() -> tuple[str, int]:
     admin = os.getenv("ADMIN_CHAT_ID", "").strip()
     if not token:
         raise RuntimeError(f"TELEGRAM_BOT_TOKEN is missing in {ENV_PATH}")
-    if not admin:
-        raise RuntimeError(f"ADMIN_CHAT_ID is missing in {ENV_PATH}")
-    ids = parse_admin_chat_ids(admin)
+    ids = parse_admin_chat_ids(admin) if admin else []
+    if admin_route_mode() == "forum_topic":
+        group_id = admin_forum_group_id()
+        if group_id is None:
+            raise RuntimeError(f"ADMIN_FORUM_GROUP_ID is missing or invalid in {ENV_PATH}")
+        return token, ids[0] if ids else group_id
     if not ids:
-        raise RuntimeError(f"ADMIN_CHAT_ID is invalid in {ENV_PATH}")
+        raise RuntimeError(f"ADMIN_CHAT_ID is missing or invalid in {ENV_PATH}")
     return token, ids[0]
 
 
 def bot_env_configured() -> bool:
     load_dotenv(ENV_PATH, override=True)
-    return bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip() and os.getenv("ADMIN_CHAT_ID", "").strip())
+    token_ready = bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip())
+    if not token_ready:
+        return False
+    if admin_route_mode() == "forum_topic":
+        return admin_forum_group_id() is not None
+    return bool(os.getenv("ADMIN_CHAT_ID", "").strip())
 
 
 async def main_async(run_once: bool = False, panel_only: bool = False) -> None:

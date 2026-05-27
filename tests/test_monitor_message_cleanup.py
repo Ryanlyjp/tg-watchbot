@@ -79,22 +79,29 @@ class FakeBot:
         self.deleted: list[tuple[int, int]] = []
         self.sent_texts: list[str] = []
         self.sent_chat_ids: list[int] = []
+        self.sent_message_threads: list[int | None] = []
         self.sent_photos: list[tuple[int, str, str | None]] = []
+        self.created_topics: list[tuple[int, str]] = []
         self.fail_chat_ids: set[int] = set()
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         self.deleted.append((chat_id, message_id))
 
-    async def send_message(self, chat_id: int, text: str, disable_web_page_preview: bool = False):
+    async def send_message(self, chat_id: int, text: str, disable_web_page_preview: bool = False, message_thread_id=None):
         if chat_id in self.fail_chat_ids:
             raise RuntimeError("send failed")
         self.sent_chat_ids.append(chat_id)
         self.sent_texts.append(text)
+        self.sent_message_threads.append(message_thread_id)
         return SimpleNamespace(message_id=3003)
 
     async def send_photo(self, chat_id: int, file_id: str, caption: str | None = None):
         self.sent_photos.append((chat_id, file_id, caption))
         return SimpleNamespace(message_id=4004)
+
+    async def create_forum_topic(self, chat_id: int, name: str):
+        self.created_topics.append((chat_id, name))
+        return SimpleNamespace(message_thread_id=777)
 
 
 class MonitorMessageCleanupTest(unittest.TestCase):
@@ -303,11 +310,12 @@ class MonitorMessageCleanupTest(unittest.TestCase):
         fake_bot = FakeBot()
         app.bot = fake_bot
         app.admin_chat_ids = [1001]
-        app.pending_sendpic = {1001: {"target": 2001, "caption": "图片备注", "created_at": 9999999999}}
+        app.pending_sendpic = {"1001:0:0": {"target": 2001, "caption": "图片备注", "created_at": 9999999999}}
 
         class FakePhotoMessage:
             def __init__(self) -> None:
                 self.chat = SimpleNamespace(id=1001)
+                self.from_user = None
                 self.text = None
                 self.caption = None
                 self.photo = [SimpleNamespace(file_id="file-1")]
@@ -331,6 +339,136 @@ class MonitorMessageCleanupTest(unittest.TestCase):
             app.pending_sendpic = old_pending_sendpic
             app.admin_chat_ids = old_admin_chat_ids
 
+    def test_is_admin_action_message_accepts_forum_topic_plain_message(self) -> None:
+        old_mode = os.environ.get("ADMIN_ROUTE_MODE")
+        old_group = os.environ.get("ADMIN_FORUM_GROUP_ID")
+        old_admin_chat_ids = app.admin_chat_ids
+        os.environ["ADMIN_ROUTE_MODE"] = "forum_topic"
+        os.environ["ADMIN_FORUM_GROUP_ID"] = "-1001234567890"
+        app.admin_chat_ids = []
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-1001234567890),
+            text="topic 内直接回复",
+            reply_to_message=None,
+            message_thread_id=777,
+            from_user=SimpleNamespace(id=1),
+        )
+        try:
+            self.assertTrue(app.is_admin_action_message(message))
+        finally:
+            app.admin_chat_ids = old_admin_chat_ids
+            if old_mode is None:
+                os.environ.pop("ADMIN_ROUTE_MODE", None)
+            else:
+                os.environ["ADMIN_ROUTE_MODE"] = old_mode
+            if old_group is None:
+                os.environ.pop("ADMIN_FORUM_GROUP_ID", None)
+            else:
+                os.environ["ADMIN_FORUM_GROUP_ID"] = old_group
+
+    def test_user_message_forum_mode_creates_topic_and_forwards(self) -> None:
+        old_bot = app.bot
+        old_config = app.config
+        old_admin_chat_ids = app.admin_chat_ids
+        old_mode = os.environ.get("ADMIN_ROUTE_MODE")
+        old_group = os.environ.get("ADMIN_FORUM_GROUP_ID")
+        fake_bot = FakeBot()
+        app.bot = fake_bot
+        app.admin_chat_ids = []
+        app.config = {"bot": {"spam_filter": {"enabled": False}, "rate_limit": {"window_seconds": 10, "max_messages": 99}}}
+        os.environ["ADMIN_ROUTE_MODE"] = "forum_topic"
+        os.environ["ADMIN_FORUM_GROUP_ID"] = "-1001234567890"
+
+        class FakePrivateMessage:
+            def __init__(self) -> None:
+                self.chat = SimpleNamespace(id=2001, type="private")
+                self.from_user = SimpleNamespace(id=2001, first_name="Alice", last_name="", username="alice")
+                self.text = "你好，我想咨询"
+                self.caption = None
+                self.message_id = 5001
+                self.content_type = "text"
+                self.answers: list[str] = []
+                self.copy_calls: list[tuple[int, int | None, int | None]] = []
+
+            async def answer(self, text: str):
+                self.answers.append(text)
+
+            async def copy_to(self, chat_id: int, reply_to_message_id=None, message_thread_id=None):
+                self.copy_calls.append((chat_id, reply_to_message_id, message_thread_id))
+                return SimpleNamespace(message_id=6006)
+
+        message = FakePrivateMessage()
+        try:
+            asyncio.run(app.user_message(message))
+            self.assertEqual([(-1001234567890, "Alice @alice | 2001")], fake_bot.created_topics)
+            self.assertEqual([-1001234567890], fake_bot.sent_chat_ids)
+            self.assertEqual([777], fake_bot.sent_message_threads)
+            self.assertEqual([(-1001234567890, 3003, 777)], message.copy_calls)
+            topic = app.get_forum_topic_by_user(2001)
+            self.assertIsNotNone(topic)
+            self.assertEqual(777, topic["message_thread_id"])
+            self.assertEqual(["已转交管理员。"], message.answers)
+        finally:
+            app.bot = old_bot
+            app.config = old_config
+            app.admin_chat_ids = old_admin_chat_ids
+            if old_mode is None:
+                os.environ.pop("ADMIN_ROUTE_MODE", None)
+            else:
+                os.environ["ADMIN_ROUTE_MODE"] = old_mode
+            if old_group is None:
+                os.environ.pop("ADMIN_FORUM_GROUP_ID", None)
+            else:
+                os.environ["ADMIN_FORUM_GROUP_ID"] = old_group
+
+    def test_admin_reply_by_message_uses_forum_thread_mapping_without_reply(self) -> None:
+        old_bot = app.bot
+        old_admin_chat_ids = app.admin_chat_ids
+        old_mode = os.environ.get("ADMIN_ROUTE_MODE")
+        old_group = os.environ.get("ADMIN_FORUM_GROUP_ID")
+        app.upsert_user(2001, "Alice", "alice")
+        app.save_forum_topic(2001, -1001234567890, 777, "Alice @alice | 2001")
+        app.bot = object()
+        app.admin_chat_ids = []
+        os.environ["ADMIN_ROUTE_MODE"] = "forum_topic"
+        os.environ["ADMIN_FORUM_GROUP_ID"] = "-1001234567890"
+
+        class FakeTopicAdminMessage:
+            def __init__(self) -> None:
+                self.chat = SimpleNamespace(id=-1001234567890)
+                self.message_thread_id = 777
+                self.reply_to_message = None
+                self.text = "收到，我们处理"
+                self.caption = None
+                self.content_type = "text"
+                self.from_user = SimpleNamespace(id=42)
+                self.replies: list[str] = []
+
+            async def copy_to(self, user_id: int):
+                self.copied_user_id = user_id
+                return SimpleNamespace(message_id=7007)
+
+            async def reply(self, text: str):
+                self.replies.append(text)
+
+        message = FakeTopicAdminMessage()
+        try:
+            asyncio.run(app.admin_reply_by_message(message))
+            self.assertEqual(2001, message.copied_user_id)
+            self.assertTrue(message.replies)
+            self.assertIn("message_id=7007", message.replies[0])
+        finally:
+            app.bot = old_bot
+            app.admin_chat_ids = old_admin_chat_ids
+            if old_mode is None:
+                os.environ.pop("ADMIN_ROUTE_MODE", None)
+            else:
+                os.environ["ADMIN_ROUTE_MODE"] = old_mode
+            if old_group is None:
+                os.environ.pop("ADMIN_FORUM_GROUP_ID", None)
+            else:
+                os.environ["ADMIN_FORUM_GROUP_ID"] = old_group
+
 
 class BotConfigurationTest(unittest.TestCase):
     def test_parse_admin_chat_ids_keeps_unique_first_three(self) -> None:
@@ -350,8 +488,10 @@ class BotConfigurationTest(unittest.TestCase):
     def test_bot_is_configured_with_token_and_admin_chat_id(self) -> None:
         old_token = os.environ.get("TELEGRAM_BOT_TOKEN")
         old_admin = os.environ.get("ADMIN_CHAT_ID")
+        old_mode = os.environ.get("ADMIN_ROUTE_MODE")
         os.environ["TELEGRAM_BOT_TOKEN"] = "123456:test-token"
         os.environ["ADMIN_CHAT_ID"] = "1001"
+        os.environ["ADMIN_ROUTE_MODE"] = "direct"
         try:
             self.assertTrue(app.bot_env_configured())
         finally:
@@ -363,6 +503,39 @@ class BotConfigurationTest(unittest.TestCase):
                 os.environ.pop("ADMIN_CHAT_ID", None)
             else:
                 os.environ["ADMIN_CHAT_ID"] = old_admin
+            if old_mode is None:
+                os.environ.pop("ADMIN_ROUTE_MODE", None)
+            else:
+                os.environ["ADMIN_ROUTE_MODE"] = old_mode
+
+    def test_bot_is_configured_in_forum_mode_without_admin_chat_id(self) -> None:
+        old_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        old_admin = os.environ.get("ADMIN_CHAT_ID")
+        old_mode = os.environ.get("ADMIN_ROUTE_MODE")
+        old_group = os.environ.get("ADMIN_FORUM_GROUP_ID")
+        os.environ["TELEGRAM_BOT_TOKEN"] = "123456:test-token"
+        os.environ.pop("ADMIN_CHAT_ID", None)
+        os.environ["ADMIN_ROUTE_MODE"] = "forum_topic"
+        os.environ["ADMIN_FORUM_GROUP_ID"] = "-1001234567890"
+        try:
+            self.assertTrue(app.bot_env_configured())
+        finally:
+            if old_token is None:
+                os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+            else:
+                os.environ["TELEGRAM_BOT_TOKEN"] = old_token
+            if old_admin is None:
+                os.environ.pop("ADMIN_CHAT_ID", None)
+            else:
+                os.environ["ADMIN_CHAT_ID"] = old_admin
+            if old_mode is None:
+                os.environ.pop("ADMIN_ROUTE_MODE", None)
+            else:
+                os.environ["ADMIN_ROUTE_MODE"] = old_mode
+            if old_group is None:
+                os.environ.pop("ADMIN_FORUM_GROUP_ID", None)
+            else:
+                os.environ["ADMIN_FORUM_GROUP_ID"] = old_group
 
     def test_write_env_values_preserves_existing_session_secret(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -380,6 +553,24 @@ class BotConfigurationTest(unittest.TestCase):
                     "WEB_PANEL_SESSION_SECRET=keep-me",
                     app.ENV_PATH.read_text(encoding="utf-8"),
                 )
+            finally:
+                app.ENV_PATH = old_env_path
+
+    def test_write_env_values_persists_forum_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            old_env_path = app.ENV_PATH
+            app.ENV_PATH = Path(temp_dir) / ".env"
+            try:
+                app.write_env_values({
+                    "TELEGRAM_BOT_TOKEN": "123456:test-token",
+                    "ADMIN_ROUTE_MODE": "forum_topic",
+                    "ADMIN_FORUM_GROUP_ID": "-1001234567890",
+                    "WEB_PANEL_USER": "admin",
+                    "WEB_PANEL_PASSWORD": "change-me",
+                })
+                content = app.ENV_PATH.read_text(encoding="utf-8")
+                self.assertIn("ADMIN_ROUTE_MODE=forum_topic", content)
+                self.assertIn("ADMIN_FORUM_GROUP_ID=-1001234567890", content)
             finally:
                 app.ENV_PATH = old_env_path
 
