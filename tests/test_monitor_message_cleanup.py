@@ -81,13 +81,29 @@ class FakeBot:
         self.sent_chat_ids: list[int] = []
         self.sent_message_threads: list[int | None] = []
         self.sent_photos: list[tuple[int, str, str | None]] = []
+        self.sent_documents: list[tuple[int, str, str | None]] = []
+        self.sent_videos: list[tuple[int, str, str | None]] = []
+        self.sent_audios: list[tuple[int, str, str | None]] = []
+        self.sent_voices: list[tuple[int, str | None]] = []
+        self.sent_video_notes: list[tuple[int, str]] = []
+        self.sent_stickers: list[tuple[int, str]] = []
+        self.sent_animations: list[tuple[int, str, str | None]] = []
+        self.sent_locations: list[tuple[int, float, float]] = []
+        self.sent_contacts: list[tuple[int, str, str, str | None]] = []
         self.created_topics: list[tuple[int, str]] = []
         self.fail_chat_ids: set[int] = set()
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         self.deleted.append((chat_id, message_id))
 
-    async def send_message(self, chat_id: int, text: str, disable_web_page_preview: bool = False, message_thread_id=None):
+    async def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        disable_web_page_preview: bool = False,
+        message_thread_id=None,
+        entities=None,
+    ):
         if chat_id in self.fail_chat_ids:
             raise RuntimeError("send failed")
         self.sent_chat_ids.append(chat_id)
@@ -95,9 +111,45 @@ class FakeBot:
         self.sent_message_threads.append(message_thread_id)
         return SimpleNamespace(message_id=3003)
 
-    async def send_photo(self, chat_id: int, file_id: str, caption: str | None = None):
+    async def send_photo(self, chat_id: int, file_id: str, caption: str | None = None, caption_entities=None):
         self.sent_photos.append((chat_id, file_id, caption))
         return SimpleNamespace(message_id=4004)
+
+    async def send_document(self, chat_id: int, file_id: str, caption: str | None = None, caption_entities=None):
+        self.sent_documents.append((chat_id, file_id, caption))
+        return SimpleNamespace(message_id=5005)
+
+    async def send_video(self, chat_id: int, file_id: str, caption: str | None = None, caption_entities=None):
+        self.sent_videos.append((chat_id, file_id, caption))
+        return SimpleNamespace(message_id=5006)
+
+    async def send_audio(self, chat_id: int, file_id: str, caption: str | None = None, caption_entities=None):
+        self.sent_audios.append((chat_id, file_id, caption))
+        return SimpleNamespace(message_id=5007)
+
+    async def send_voice(self, chat_id: int, file_id: str, caption: str | None = None, caption_entities=None):
+        self.sent_voices.append((chat_id, caption))
+        return SimpleNamespace(message_id=5008)
+
+    async def send_video_note(self, chat_id: int, file_id: str, length=None):
+        self.sent_video_notes.append((chat_id, file_id))
+        return SimpleNamespace(message_id=5009)
+
+    async def send_sticker(self, chat_id: int, file_id: str):
+        self.sent_stickers.append((chat_id, file_id))
+        return SimpleNamespace(message_id=5010)
+
+    async def send_animation(self, chat_id: int, file_id: str, caption: str | None = None, caption_entities=None):
+        self.sent_animations.append((chat_id, file_id, caption))
+        return SimpleNamespace(message_id=5011)
+
+    async def send_location(self, chat_id: int, latitude: float, longitude: float):
+        self.sent_locations.append((chat_id, latitude, longitude))
+        return SimpleNamespace(message_id=5012)
+
+    async def send_contact(self, chat_id: int, phone_number: str, first_name: str, last_name: str | None = None):
+        self.sent_contacts.append((chat_id, phone_number, first_name, last_name))
+        return SimpleNamespace(message_id=5013)
 
     async def create_forum_topic(self, chat_id: int, name: str):
         self.created_topics.append((chat_id, name))
@@ -237,28 +289,26 @@ class MonitorMessageCleanupTest(unittest.TestCase):
     def test_copy_message_to_user_records_media_log(self) -> None:
         old_bot = app.bot
         app.upsert_user(2001, "User", "user")
+        fake_bot = FakeBot()
 
         class FakeMediaMessage:
             content_type = "photo"
             text = None
             caption = "证件照"
-
-            async def copy_to(self, user_id: int):
-                self.copied_user_id = user_id
-                return SimpleNamespace(message_id=6006)
+            photo = [SimpleNamespace(file_id="photo-file")]
 
         message = FakeMediaMessage()
-        app.bot = object()
+        app.bot = fake_bot
         try:
             message_id = asyncio.run(app.copy_message_to_user(2001, message, "tg:reply"))
-            self.assertEqual(6006, message_id)
-            self.assertEqual(2001, message.copied_user_id)
+            self.assertEqual(4004, message_id)
+            self.assertEqual([(2001, "photo-file", "证件照")], fake_bot.sent_photos)
             with closing(sqlite3.connect(app.DB_PATH)) as conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute(
                     "SELECT source, text, message_type, user_message_id FROM inbox_messages WHERE direction='out' ORDER BY id DESC LIMIT 1"
                 ).fetchone()
-            self.assertEqual(("tg:reply", "证件照", "photo", 6006), (row["source"], row["text"], row["message_type"], row["user_message_id"]))
+            self.assertEqual(("tg:reply", "证件照", "photo", 4004), (row["source"], row["text"], row["message_type"], row["user_message_id"]))
         finally:
             app.bot = old_bot
 
@@ -275,21 +325,19 @@ class MonitorMessageCleanupTest(unittest.TestCase):
                 self.text = None
                 self.caption = "资料图"
                 self.content_type = "photo"
+                self.photo = [SimpleNamespace(file_id="reply-photo")]
                 self.replies: list[str] = []
-
-            async def copy_to(self, user_id: int):
-                self.copied_user_id = user_id
-                return SimpleNamespace(message_id=7007)
 
             async def reply(self, text: str):
                 self.replies.append(text)
 
         message = FakeAdminReply()
-        app.bot = object()
+        fake_bot = FakeBot()
+        app.bot = fake_bot
         app.admin_chat_ids = [1001]
         try:
             asyncio.run(app.admin_reply_by_message(message))
-            self.assertEqual(2001, message.copied_user_id)
+            self.assertEqual([(2001, "reply-photo", "资料图")], fake_bot.sent_photos)
             self.assertTrue(message.replies)
             self.assertIn("类型=photo", message.replies[0])
             with closing(sqlite3.connect(app.DB_PATH)) as conn:
@@ -297,7 +345,7 @@ class MonitorMessageCleanupTest(unittest.TestCase):
                 row = conn.execute(
                     "SELECT source, text, message_type, user_message_id FROM inbox_messages WHERE direction='out' ORDER BY id DESC LIMIT 1"
                 ).fetchone()
-            self.assertEqual(("tg:reply", "资料图", "photo", 7007), (row["source"], row["text"], row["message_type"], row["user_message_id"]))
+            self.assertEqual(("tg:reply", "资料图", "photo", 4004), (row["source"], row["text"], row["message_type"], row["user_message_id"]))
         finally:
             app.bot = old_bot
             app.admin_chat_ids = old_admin_chat_ids
@@ -428,7 +476,8 @@ class MonitorMessageCleanupTest(unittest.TestCase):
         old_group = os.environ.get("ADMIN_FORUM_GROUP_ID")
         app.upsert_user(2001, "Alice", "alice")
         app.save_forum_topic(2001, -1001234567890, 777, "Alice @alice | 2001")
-        app.bot = object()
+        fake_bot = FakeBot()
+        app.bot = fake_bot
         app.admin_chat_ids = []
         os.environ["ADMIN_ROUTE_MODE"] = "forum_topic"
         os.environ["ADMIN_FORUM_GROUP_ID"] = "-1001234567890"
@@ -444,19 +493,15 @@ class MonitorMessageCleanupTest(unittest.TestCase):
                 self.from_user = SimpleNamespace(id=42)
                 self.replies: list[str] = []
 
-            async def copy_to(self, user_id: int):
-                self.copied_user_id = user_id
-                return SimpleNamespace(message_id=7007)
-
             async def reply(self, text: str):
                 self.replies.append(text)
 
         message = FakeTopicAdminMessage()
         try:
             asyncio.run(app.admin_reply_by_message(message))
-            self.assertEqual(2001, message.copied_user_id)
+            self.assertEqual([2001], fake_bot.sent_chat_ids)
             self.assertTrue(message.replies)
-            self.assertIn("message_id=7007", message.replies[0])
+            self.assertIn("message_id=3003", message.replies[0])
         finally:
             app.bot = old_bot
             app.admin_chat_ids = old_admin_chat_ids

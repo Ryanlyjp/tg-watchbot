@@ -1311,27 +1311,106 @@ async def send_text_to_user(user_id: int, text: str, source: str = "web") -> int
     return int(sent.message_id)
 
 
-async def copy_message_to_user(user_id: int, message: Message, source: str = "tg:reply") -> int:
+async def send_message_to_user(user_id: int, message: Message, source: str = "tg:reply") -> int:
     if is_blocked(user_id):
         raise ValueError(f"用户 {user_id} 已被封禁")
     if not bot:
         raise RuntimeError("Bot 尚未初始化")
-    sent = await message.copy_to(user_id)
+    sent: Any
+    content_type = message_content_type(message)
+    if getattr(message, "text", None):
+        sent = await bot.send_message(
+            user_id,
+            message.text,
+            entities=getattr(message, "entities", None),
+        )
+    elif getattr(message, "photo", None):
+        sent = await bot.send_photo(
+            user_id,
+            message.photo[-1].file_id,
+            caption=getattr(message, "caption", None) or None,
+            caption_entities=getattr(message, "caption_entities", None),
+        )
+    elif getattr(message, "document", None):
+        sent = await bot.send_document(
+            user_id,
+            message.document.file_id,
+            caption=getattr(message, "caption", None) or None,
+            caption_entities=getattr(message, "caption_entities", None),
+        )
+    elif getattr(message, "video", None):
+        sent = await bot.send_video(
+            user_id,
+            message.video.file_id,
+            caption=getattr(message, "caption", None) or None,
+            caption_entities=getattr(message, "caption_entities", None),
+        )
+    elif getattr(message, "audio", None):
+        sent = await bot.send_audio(
+            user_id,
+            message.audio.file_id,
+            caption=getattr(message, "caption", None) or None,
+            caption_entities=getattr(message, "caption_entities", None),
+        )
+    elif getattr(message, "voice", None):
+        sent = await bot.send_voice(
+            user_id,
+            message.voice.file_id,
+            caption=getattr(message, "caption", None) or None,
+            caption_entities=getattr(message, "caption_entities", None),
+        )
+    elif getattr(message, "video_note", None):
+        sent = await bot.send_video_note(
+            user_id,
+            message.video_note.file_id,
+            length=getattr(message.video_note, "length", None),
+        )
+    elif getattr(message, "sticker", None):
+        sent = await bot.send_sticker(
+            user_id,
+            message.sticker.file_id,
+        )
+    elif getattr(message, "animation", None):
+        sent = await bot.send_animation(
+            user_id,
+            message.animation.file_id,
+            caption=getattr(message, "caption", None) or None,
+            caption_entities=getattr(message, "caption_entities", None),
+        )
+    elif getattr(message, "location", None):
+        sent = await bot.send_location(
+            user_id,
+            latitude=message.location.latitude,
+            longitude=message.location.longitude,
+        )
+    elif getattr(message, "contact", None):
+        sent = await bot.send_contact(
+            user_id,
+            phone_number=message.contact.phone_number,
+            first_name=message.contact.first_name,
+            last_name=getattr(message.contact, "last_name", None) or None,
+        )
+    else:
+        raise ValueError(f"暂不支持转发此消息类型：{content_type}")
     message_id = int(getattr(sent, "message_id"))
     create_outbox_message(
         user_id,
         message_log_text(message),
         source,
         message_id,
-        message_content_type(message),
+        content_type,
     )
     logger.info(
-        "copied message to user_id=%s message_id=%s content_type=%s",
+        "sent typed message to user_id=%s message_id=%s content_type=%s",
         user_id,
         message_id,
-        message_content_type(message),
+        content_type,
     )
     return message_id
+
+
+async def copy_message_to_user(user_id: int, message: Message, source: str = "tg:reply") -> int:
+    return await send_message_to_user(user_id, message, source)
 
 
 def is_admin_chat(message: Message) -> bool:
