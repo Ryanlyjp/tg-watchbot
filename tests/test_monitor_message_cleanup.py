@@ -111,23 +111,58 @@ class FakeBot:
         self.sent_message_threads.append(message_thread_id)
         return SimpleNamespace(message_id=3003)
 
-    async def send_photo(self, chat_id: int, file_id: str, caption: str | None = None, caption_entities=None):
+    async def send_photo(
+        self,
+        chat_id: int,
+        file_id: str,
+        caption: str | None = None,
+        caption_entities=None,
+        message_thread_id=None,
+    ):
         self.sent_photos.append((chat_id, file_id, caption))
         return SimpleNamespace(message_id=4004)
 
-    async def send_document(self, chat_id: int, file_id: str, caption: str | None = None, caption_entities=None):
+    async def send_document(
+        self,
+        chat_id: int,
+        file_id: str,
+        caption: str | None = None,
+        caption_entities=None,
+        message_thread_id=None,
+    ):
         self.sent_documents.append((chat_id, file_id, caption))
         return SimpleNamespace(message_id=5005)
 
-    async def send_video(self, chat_id: int, file_id: str, caption: str | None = None, caption_entities=None):
+    async def send_video(
+        self,
+        chat_id: int,
+        file_id: str,
+        caption: str | None = None,
+        caption_entities=None,
+        message_thread_id=None,
+    ):
         self.sent_videos.append((chat_id, file_id, caption))
         return SimpleNamespace(message_id=5006)
 
-    async def send_audio(self, chat_id: int, file_id: str, caption: str | None = None, caption_entities=None):
+    async def send_audio(
+        self,
+        chat_id: int,
+        file_id: str,
+        caption: str | None = None,
+        caption_entities=None,
+        message_thread_id=None,
+    ):
         self.sent_audios.append((chat_id, file_id, caption))
         return SimpleNamespace(message_id=5007)
 
-    async def send_voice(self, chat_id: int, file_id: str, caption: str | None = None, caption_entities=None):
+    async def send_voice(
+        self,
+        chat_id: int,
+        file_id: str,
+        caption: str | None = None,
+        caption_entities=None,
+        message_thread_id=None,
+    ):
         self.sent_voices.append((chat_id, caption))
         return SimpleNamespace(message_id=5008)
 
@@ -139,7 +174,14 @@ class FakeBot:
         self.sent_stickers.append((chat_id, file_id))
         return SimpleNamespace(message_id=5010)
 
-    async def send_animation(self, chat_id: int, file_id: str, caption: str | None = None, caption_entities=None):
+    async def send_animation(
+        self,
+        chat_id: int,
+        file_id: str,
+        caption: str | None = None,
+        caption_entities=None,
+        message_thread_id=None,
+    ):
         self.sent_animations.append((chat_id, file_id, caption))
         return SimpleNamespace(message_id=5011)
 
@@ -449,9 +491,9 @@ class MonitorMessageCleanupTest(unittest.TestCase):
             asyncio.run(app.user_message(message))
             self.assertEqual([(-1001234567890, "Alice @alice | 2001")], fake_bot.created_topics)
             self.assertEqual([-1001234567890], fake_bot.sent_chat_ids)
-            self.assertEqual(["#1 Alice\n<code>2001</code> · @alice"], fake_bot.sent_texts)
+            self.assertEqual(["#1 Alice\n<code>2001</code> · @alice\n\n你好，我想咨询"], fake_bot.sent_texts)
             self.assertEqual([777], fake_bot.sent_message_threads)
-            self.assertEqual([(-1001234567890, 3003, 777)], message.copy_calls)
+            self.assertEqual([], message.copy_calls)
             topic = app.get_forum_topic_by_user(2001)
             self.assertIsNotNone(topic)
             self.assertEqual(777, topic["message_thread_id"])
@@ -505,14 +547,14 @@ class MonitorMessageCleanupTest(unittest.TestCase):
             asyncio.run(app.user_message(message))
             self.assertEqual([-1001234567890, 1001], fake_bot.sent_chat_ids)
             self.assertEqual(
-                ["#1 Alice\n<code>2001</code> · @alice", "#1 Alice\n<code>2001</code> · @alice"],
+                [
+                    "#1 Alice\n<code>2001</code> · @alice\n\n你好，我想咨询",
+                    "#1 Alice\n<code>2001</code> · @alice\n\n你好，我想咨询",
+                ],
                 fake_bot.sent_texts,
             )
             self.assertEqual([777, None], fake_bot.sent_message_threads)
-            self.assertEqual(
-                [(-1001234567890, 3003, 777), (1001, 3003, None)],
-                message.copy_calls,
-            )
+            self.assertEqual([], message.copy_calls)
             self.assertEqual(2001, app.lookup_reply_target(1001, 3003))
             self.assertEqual([], message.answers)
         finally:
@@ -527,6 +569,45 @@ class MonitorMessageCleanupTest(unittest.TestCase):
                 os.environ.pop("ADMIN_FORUM_GROUP_ID", None)
             else:
                 os.environ["ADMIN_FORUM_GROUP_ID"] = old_group
+
+    def test_user_photo_message_is_merged_into_single_media_caption(self) -> None:
+        old_bot = app.bot
+        old_config = app.config
+        old_admin_chat_ids = app.admin_chat_ids
+        fake_bot = FakeBot()
+        app.bot = fake_bot
+        app.admin_chat_ids = [1001]
+        app.config = {"bot": {"spam_filter": {"enabled": False}, "rate_limit": {"window_seconds": 10, "max_messages": 99}}}
+
+        class FakePhotoPrivateMessage:
+            def __init__(self) -> None:
+                self.chat = SimpleNamespace(id=2001, type="private")
+                self.from_user = SimpleNamespace(id=2001, first_name="Alice", last_name="", username="alice")
+                self.text = None
+                self.caption = None
+                self.message_id = 5001
+                self.content_type = "photo"
+                self.photo = [SimpleNamespace(file_id="user-photo")]
+                self.answers: list[str] = []
+                self.copy_calls: list[tuple[int, int | None, int | None]] = []
+
+            async def answer(self, text: str):
+                self.answers.append(text)
+
+            async def copy_to(self, chat_id: int, reply_to_message_id=None, message_thread_id=None):
+                self.copy_calls.append((chat_id, reply_to_message_id, message_thread_id))
+                return SimpleNamespace(message_id=6006)
+
+        message = FakePhotoPrivateMessage()
+        try:
+            asyncio.run(app.user_message(message))
+            self.assertEqual([(1001, "user-photo", "#1 Alice\n<code>2001</code> · @alice")], fake_bot.sent_photos)
+            self.assertEqual([], message.copy_calls)
+            self.assertEqual([], message.answers)
+        finally:
+            app.bot = old_bot
+            app.config = old_config
+            app.admin_chat_ids = old_admin_chat_ids
 
     def test_admin_reply_by_message_uses_forum_thread_mapping_without_reply(self) -> None:
         old_bot = app.bot

@@ -1325,6 +1325,103 @@ def compact_admin_header(
     return f"#{inbox_id} {title}\n" + " · ".join(meta)
 
 
+def merged_admin_payload(identity: str, content: str | None, max_length: int = 4096) -> str:
+    body = identity.strip()
+    content_text = str(content or "").strip()
+    if not content_text:
+        return body[:max_length]
+    raw_limit = max(0, max_length - len(body) - 16)
+    if raw_limit <= 0:
+        return body[:max_length]
+    safe_content = html_escape(content_text[:raw_limit])
+    payload = f"{body}\n\n{safe_content}"
+    return payload[:max_length]
+
+
+async def relay_user_message_to_admin(
+    chat_id: int,
+    user_id: int,
+    inbox_id: int,
+    full_name: str,
+    username: str | None,
+    note: str | None,
+    message: Message,
+    thread_id: int | None = None,
+) -> tuple[int, int]:
+    if not bot:
+        raise RuntimeError("Bot 尚未初始化")
+    identity = compact_admin_header(inbox_id, user_id, full_name, username, note)
+    thread_kwargs = {"message_thread_id": thread_id} if thread_id is not None else {}
+    if getattr(message, "text", None):
+        sent = await bot.send_message(
+            chat_id,
+            merged_admin_payload(identity, message.text, 4096),
+            **thread_kwargs,
+        )
+        message_id = int(sent.message_id)
+        return message_id, message_id
+    if getattr(message, "photo", None):
+        sent = await bot.send_photo(
+            chat_id,
+            message.photo[-1].file_id,
+            caption=merged_admin_payload(identity, getattr(message, "caption", None), 1024),
+            **thread_kwargs,
+        )
+        message_id = int(sent.message_id)
+        return message_id, message_id
+    if getattr(message, "document", None):
+        sent = await bot.send_document(
+            chat_id,
+            message.document.file_id,
+            caption=merged_admin_payload(identity, getattr(message, "caption", None), 1024),
+            **thread_kwargs,
+        )
+        message_id = int(sent.message_id)
+        return message_id, message_id
+    if getattr(message, "video", None):
+        sent = await bot.send_video(
+            chat_id,
+            message.video.file_id,
+            caption=merged_admin_payload(identity, getattr(message, "caption", None), 1024),
+            **thread_kwargs,
+        )
+        message_id = int(sent.message_id)
+        return message_id, message_id
+    if getattr(message, "audio", None):
+        sent = await bot.send_audio(
+            chat_id,
+            message.audio.file_id,
+            caption=merged_admin_payload(identity, getattr(message, "caption", None), 1024),
+            **thread_kwargs,
+        )
+        message_id = int(sent.message_id)
+        return message_id, message_id
+    if getattr(message, "voice", None):
+        sent = await bot.send_voice(
+            chat_id,
+            message.voice.file_id,
+            caption=merged_admin_payload(identity, getattr(message, "caption", None), 1024),
+            **thread_kwargs,
+        )
+        message_id = int(sent.message_id)
+        return message_id, message_id
+    if getattr(message, "animation", None):
+        sent = await bot.send_animation(
+            chat_id,
+            message.animation.file_id,
+            caption=merged_admin_payload(identity, getattr(message, "caption", None), 1024),
+            **thread_kwargs,
+        )
+        message_id = int(sent.message_id)
+        return message_id, message_id
+    sent = await bot.send_message(chat_id, identity, **thread_kwargs)
+    copy_kwargs: dict[str, Any] = {"reply_to_message_id": sent.message_id}
+    if thread_id is not None:
+        copy_kwargs["message_thread_id"] = thread_id
+    copied = await message.copy_to(chat_id, **copy_kwargs)
+    return int(sent.message_id), int(copied.message_id)
+
+
 async def send_text_to_user(user_id: int, text: str, source: str = "web") -> int:
     if is_blocked(user_id):
         raise ValueError(f"用户 {user_id} 已被封禁")
@@ -1745,7 +1842,6 @@ async def user_message(message: Message) -> None:
         return
     user_row = get_user(uid)
     note = user_row["note"] if user_row and "note" in user_row.keys() else ""
-    header = compact_admin_header(inbox_id, uid, full, username, note)
     try:
         first_header_id = None
         first_copy_id = None
@@ -1754,18 +1850,35 @@ async def user_message(message: Message) -> None:
             if group_id is None:
                 raise RuntimeError("ADMIN_FORUM_GROUP_ID 未配置")
             thread_id, _ = await create_or_get_forum_topic(uid, full, username)
-            sent = await bot.send_message(group_id, header, message_thread_id=thread_id)  # type: ignore[union-attr]
-            save_message_map(group_id, sent.message_id, uid, message.message_id)
-            copied = await message.copy_to(group_id, reply_to_message_id=sent.message_id, message_thread_id=thread_id)  # type: ignore[arg-type]
-            save_message_map(group_id, copied.message_id, uid, message.message_id)
-            first_header_id = sent.message_id
-            first_copy_id = copied.message_id
+            sent_id, copy_id = await relay_user_message_to_admin(
+                group_id,
+                uid,
+                inbox_id,
+                full,
+                username,
+                note,
+                message,
+                thread_id=thread_id,
+            )
+            save_message_map(group_id, sent_id, uid, message.message_id)
+            if copy_id != sent_id:
+                save_message_map(group_id, copy_id, uid, message.message_id)
+            first_header_id = sent_id
+            first_copy_id = copy_id
             for chat_id in forum_mirror_admin_chat_ids():
                 try:
-                    mirror_sent = await bot.send_message(chat_id, header)  # type: ignore[union-attr]
-                    save_message_map(chat_id, mirror_sent.message_id, uid, message.message_id)
-                    mirror_copied = await message.copy_to(chat_id, reply_to_message_id=mirror_sent.message_id)  # type: ignore[arg-type]
-                    save_message_map(chat_id, mirror_copied.message_id, uid, message.message_id)
+                    mirror_sent_id, mirror_copy_id = await relay_user_message_to_admin(
+                        chat_id,
+                        uid,
+                        inbox_id,
+                        full,
+                        username,
+                        note,
+                        message,
+                    )
+                    save_message_map(chat_id, mirror_sent_id, uid, message.message_id)
+                    if mirror_copy_id != mirror_sent_id:
+                        save_message_map(chat_id, mirror_copy_id, uid, message.message_id)
                 except Exception:
                     logger.exception(
                         "failed to mirror forum user message to admin chat_id=%s user_id=%s inbox_id=%s",
@@ -1775,12 +1888,20 @@ async def user_message(message: Message) -> None:
                     )
         else:
             for chat_id in relay_admin_chat_ids():
-                sent = await bot.send_message(chat_id, header)  # type: ignore[union-attr]
-                save_message_map(chat_id, sent.message_id, uid, message.message_id)
-                copied = await message.copy_to(chat_id, reply_to_message_id=sent.message_id)  # type: ignore[arg-type]
-                save_message_map(chat_id, copied.message_id, uid, message.message_id)
-                first_header_id = first_header_id or sent.message_id
-                first_copy_id = first_copy_id or copied.message_id
+                sent_id, copy_id = await relay_user_message_to_admin(
+                    chat_id,
+                    uid,
+                    inbox_id,
+                    full,
+                    username,
+                    note,
+                    message,
+                )
+                save_message_map(chat_id, sent_id, uid, message.message_id)
+                if copy_id != sent_id:
+                    save_message_map(chat_id, copy_id, uid, message.message_id)
+                first_header_id = first_header_id or sent_id
+                first_copy_id = first_copy_id or copy_id
         mark_inbox_forwarded(inbox_id, first_header_id, first_copy_id)
     except Exception as e:
         mark_inbox_error(inbox_id, repr(e))
