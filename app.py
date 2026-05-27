@@ -2751,7 +2751,7 @@ def create_panel_app() -> FastAPI:
         ai_prompt: str,
         ai_min_interval_seconds: str,
         ai_dedupe_window_seconds: str,
-    ) -> RedirectResponse | HTMLResponse:
+    ) -> Response:
         cfg = cfg_load_fresh()
         rows = cfg.setdefault("group_monitors", [])
         if not isinstance(rows, list):
@@ -2817,7 +2817,7 @@ def create_panel_app() -> FastAPI:
         ai_prompt: str = Form(""),
         ai_min_interval_seconds: str = Form(str(DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS)),
         ai_dedupe_window_seconds: str = Form(str(DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS)),
-    ) -> RedirectResponse | HTMLResponse:
+    ) -> Response:
         return await save_group_monitor_common(
             None,
             name,
@@ -2860,7 +2860,7 @@ def create_panel_app() -> FastAPI:
         ai_prompt: str = Form(""),
         ai_min_interval_seconds: str = Form(str(DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS)),
         ai_dedupe_window_seconds: str = Form(str(DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS)),
-    ) -> RedirectResponse | HTMLResponse:
+    ) -> Response:
         return await save_group_monitor_common(
             original_index,
             name,
