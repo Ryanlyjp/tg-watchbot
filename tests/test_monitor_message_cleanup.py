@@ -432,9 +432,11 @@ class MonitorMessageCleanupTest(unittest.TestCase):
         old_mode = os.environ.get("ADMIN_ROUTE_MODE")
         old_group = os.environ.get("ADMIN_FORUM_GROUP_ID")
         old_admin_chat_ids = app.admin_chat_ids
+        old_bot = app.bot
         os.environ["ADMIN_ROUTE_MODE"] = "forum_topic"
         os.environ["ADMIN_FORUM_GROUP_ID"] = "-1001234567890"
         app.admin_chat_ids = []
+        app.bot = object()
         message = SimpleNamespace(
             chat=SimpleNamespace(id=-1001234567890),
             text="topic 内直接回复",
@@ -445,6 +447,7 @@ class MonitorMessageCleanupTest(unittest.TestCase):
         try:
             self.assertTrue(app.is_admin_action_message(message))
         finally:
+            app.bot = old_bot
             app.admin_chat_ids = old_admin_chat_ids
             if old_mode is None:
                 os.environ.pop("ADMIN_ROUTE_MODE", None)
@@ -658,9 +661,26 @@ class BotConfigurationTest(unittest.TestCase):
     def test_parse_admin_chat_ids_keeps_unique_first_three(self) -> None:
         self.assertEqual([1, 2, 3], app.parse_admin_chat_ids("1,2 2;3,4"))
 
+    def test_role_bot_token_falls_back_to_shared_token(self) -> None:
+        old_shared = os.environ.get("TELEGRAM_BOT_TOKEN")
+        old_monitor = os.environ.pop("MONITOR_BOT_TOKEN", None)
+        os.environ["TELEGRAM_BOT_TOKEN"] = "123456:shared-token"
+        try:
+            self.assertEqual("123456:shared-token", app.role_bot_token(app.BOT_ROLE_MONITOR))
+        finally:
+            if old_shared is None:
+                os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+            else:
+                os.environ["TELEGRAM_BOT_TOKEN"] = old_shared
+            if old_monitor is not None:
+                os.environ["MONITOR_BOT_TOKEN"] = old_monitor
+
     def test_bot_is_not_configured_without_token_or_admin_chat_id(self) -> None:
         old_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
         old_admin = os.environ.pop("ADMIN_CHAT_ID", None)
+        old_relay = os.environ.pop("RELAY_BOT_TOKEN", None)
+        old_monitor = os.environ.pop("MONITOR_BOT_TOKEN", None)
+        old_group = os.environ.pop("GROUP_BOT_TOKEN", None)
         try:
             self.assertFalse(app.bot_env_configured())
         finally:
@@ -668,6 +688,12 @@ class BotConfigurationTest(unittest.TestCase):
                 os.environ["TELEGRAM_BOT_TOKEN"] = old_token
             if old_admin is not None:
                 os.environ["ADMIN_CHAT_ID"] = old_admin
+            if old_relay is not None:
+                os.environ["RELAY_BOT_TOKEN"] = old_relay
+            if old_monitor is not None:
+                os.environ["MONITOR_BOT_TOKEN"] = old_monitor
+            if old_group is not None:
+                os.environ["GROUP_BOT_TOKEN"] = old_group
 
     def test_bot_is_configured_with_token_and_admin_chat_id(self) -> None:
         old_token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -683,6 +709,36 @@ class BotConfigurationTest(unittest.TestCase):
                 os.environ.pop("TELEGRAM_BOT_TOKEN", None)
             else:
                 os.environ["TELEGRAM_BOT_TOKEN"] = old_token
+            if old_admin is None:
+                os.environ.pop("ADMIN_CHAT_ID", None)
+            else:
+                os.environ["ADMIN_CHAT_ID"] = old_admin
+            if old_mode is None:
+                os.environ.pop("ADMIN_ROUTE_MODE", None)
+            else:
+                os.environ["ADMIN_ROUTE_MODE"] = old_mode
+
+    def test_bot_is_configured_with_monitor_token_only(self) -> None:
+        old_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+        old_monitor = os.environ.get("MONITOR_BOT_TOKEN")
+        old_admin = os.environ.get("ADMIN_CHAT_ID")
+        old_mode = os.environ.get("ADMIN_ROUTE_MODE")
+        os.environ["MONITOR_BOT_TOKEN"] = "123456:monitor-token"
+        os.environ["ADMIN_CHAT_ID"] = "1001"
+        os.environ["ADMIN_ROUTE_MODE"] = "direct"
+        try:
+            self.assertTrue(app.bot_env_configured())
+            self.assertFalse(app.relay_bot_env_configured())
+            self.assertTrue(app.monitor_bot_env_configured())
+        finally:
+            if old_token is not None:
+                os.environ["TELEGRAM_BOT_TOKEN"] = old_token
+            else:
+                os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+            if old_monitor is None:
+                os.environ.pop("MONITOR_BOT_TOKEN", None)
+            else:
+                os.environ["MONITOR_BOT_TOKEN"] = old_monitor
             if old_admin is None:
                 os.environ.pop("ADMIN_CHAT_ID", None)
             else:
@@ -755,6 +811,27 @@ class BotConfigurationTest(unittest.TestCase):
                 content = app.ENV_PATH.read_text(encoding="utf-8")
                 self.assertIn("ADMIN_ROUTE_MODE=forum_topic", content)
                 self.assertIn("ADMIN_FORUM_GROUP_ID=-1001234567890", content)
+            finally:
+                app.ENV_PATH = old_env_path
+
+    def test_write_env_values_persists_role_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            old_env_path = app.ENV_PATH
+            app.ENV_PATH = Path(temp_dir) / ".env"
+            try:
+                app.write_env_values({
+                    "TELEGRAM_BOT_TOKEN": "123456:shared",
+                    "RELAY_BOT_TOKEN": "123456:relay",
+                    "MONITOR_BOT_TOKEN": "123456:monitor",
+                    "GROUP_BOT_TOKEN": "123456:group",
+                    "ADMIN_CHAT_ID": "1001",
+                    "WEB_PANEL_USER": "admin",
+                    "WEB_PANEL_PASSWORD": "change-me",
+                })
+                content = app.ENV_PATH.read_text(encoding="utf-8")
+                self.assertIn("RELAY_BOT_TOKEN=123456:relay", content)
+                self.assertIn("MONITOR_BOT_TOKEN=123456:monitor", content)
+                self.assertIn("GROUP_BOT_TOKEN=123456:group", content)
             finally:
                 app.ENV_PATH = old_env_path
 

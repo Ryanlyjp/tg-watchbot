@@ -70,7 +70,12 @@ DEFAULT_UA = (
 
 logger = logging.getLogger("tg-watchbot")
 router = Router()
+BOT_ROLE_RELAY = "relay"
+BOT_ROLE_MONITOR = "monitor"
+BOT_ROLE_GROUP = "group"
 bot: Bot | None = None
+monitor_bot: Bot | None = None
+group_bot: Bot | None = None
 admin_chat_id: int | None = None
 admin_chat_ids: list[int] = []
 config: dict[str, Any] = {}
@@ -325,6 +330,74 @@ def parse_admin_chat_ids(raw: str) -> list[int]:
     return list(dict.fromkeys(ids))[:3]
 
 
+def bot_token_env_name(role: str) -> str:
+    return {
+        BOT_ROLE_RELAY: "RELAY_BOT_TOKEN",
+        BOT_ROLE_MONITOR: "MONITOR_BOT_TOKEN",
+        BOT_ROLE_GROUP: "GROUP_BOT_TOKEN",
+    }.get(role, "TELEGRAM_BOT_TOKEN")
+
+
+def role_bot_token(role: str) -> str:
+    load_dotenv(ENV_PATH, override=True)
+    specific = os.getenv(bot_token_env_name(role), "").strip()
+    if specific:
+        return specific
+    return os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
+
+def notification_route_configured() -> bool:
+    load_dotenv(ENV_PATH, override=True)
+    if admin_route_mode() == "forum_topic":
+        return admin_forum_group_id() is not None
+    return bool(os.getenv("ADMIN_CHAT_ID", "").strip())
+
+
+def relay_bot_env_configured() -> bool:
+    return bool(role_bot_token(BOT_ROLE_RELAY)) and notification_route_configured()
+
+
+def monitor_bot_env_configured() -> bool:
+    return bool(role_bot_token(BOT_ROLE_MONITOR)) and notification_route_configured()
+
+
+def group_bot_env_configured() -> bool:
+    return bool(role_bot_token(BOT_ROLE_GROUP)) and notification_route_configured()
+
+
+def role_env_configured(role: str) -> bool:
+    if role == BOT_ROLE_RELAY:
+        return relay_bot_env_configured()
+    if role == BOT_ROLE_MONITOR:
+        return monitor_bot_env_configured()
+    if role == BOT_ROLE_GROUP:
+        return group_bot_env_configured()
+    return False
+
+
+def role_bot_client(role: str) -> Bot | None:
+    if role == BOT_ROLE_RELAY:
+        return bot
+    if role == BOT_ROLE_MONITOR:
+        return monitor_bot or bot
+    if role == BOT_ROLE_GROUP:
+        return group_bot or bot
+    return None
+
+
+def role_token_matches_message(message: Message, role: str) -> bool:
+    message_bot = getattr(message, "bot", None)
+    current = role_bot_client(role)
+    if not role_env_configured(role):
+        if message_bot is None:
+            return current is not None
+        return current is not None and message_bot is current
+    message_token = str(getattr(message_bot, "token", "") or "")
+    if message_token:
+        return message_token == role_bot_token(role)
+    return current is not None
+
+
 def admin_route_mode() -> str:
     load_dotenv(ENV_PATH, override=True)
     mode = os.getenv("ADMIN_ROUTE_MODE", "direct").strip().lower()
@@ -390,7 +463,12 @@ def message_thread_id(message: Message) -> int:
 
 def is_forum_admin_chat(message: Message) -> bool:
     group_id = admin_forum_group_id()
-    return forum_topic_enabled() and group_id is not None and int(message.chat.id) == int(group_id)
+    return (
+        role_token_matches_message(message, BOT_ROLE_RELAY)
+        and forum_topic_enabled()
+        and group_id is not None
+        and int(message.chat.id) == int(group_id)
+    )
 
 
 def admin_context_key(message: Message) -> str:
@@ -468,10 +546,11 @@ async def create_or_get_forum_topic(user_id: int, full_name: str, username: str 
     existing = get_forum_topic_by_user(user_id)
     if existing and int(existing["admin_chat_id"]) == int(group_id):
         return int(existing["message_thread_id"]), False
-    if not bot:
+    relay_bot = role_bot_client(BOT_ROLE_RELAY)
+    if not relay_bot:
         raise RuntimeError("Bot 尚未初始化")
     topic_name = build_forum_topic_name(user_id, full_name, username)
-    topic = await bot.create_forum_topic(chat_id=group_id, name=topic_name)  # type: ignore[union-attr]
+    topic = await relay_bot.create_forum_topic(chat_id=group_id, name=topic_name)  # type: ignore[union-attr]
     thread_id = int(getattr(topic, "message_thread_id"))
     save_forum_topic(user_id, group_id, thread_id, topic_name)
     return thread_id, True
@@ -963,7 +1042,7 @@ async def handle_group_keyword_message(message: Message, listen_source: str = "b
             reason,
         )
         return False
-    await admin_send(await summarize_group_message(message, monitor, hits))
+    await admin_send_group(await summarize_group_message(message, monitor, hits))
     return True
 
 
@@ -1246,25 +1325,27 @@ def describe_sendpic_target(user_id: int) -> str:
 
 async def admin_send(text: str) -> None:
     targets = admin_notification_chat_ids()
-    if not bot or not targets:
+    relay_bot = role_bot_client(BOT_ROLE_RELAY)
+    if not relay_bot or not targets:
         logger.error("admin_send called before bot/admin init: %s", text)
         return
     for chat_id in targets:
         try:
-            await bot.send_message(chat_id, text, disable_web_page_preview=False)
+            await relay_bot.send_message(chat_id, text, disable_web_page_preview=False)
         except Exception:
             logger.exception("failed to send admin notification chat_id=%s", chat_id)
 
 
 async def admin_send_monitor(text: str, monitor_name: str) -> bool:
     targets = admin_notification_chat_ids()
-    if not bot or not targets:
+    notify_bot = role_bot_client(BOT_ROLE_MONITOR)
+    if not notify_bot or not targets:
         logger.error("admin_send_monitor called before bot/admin init: %s", text)
         return False
     sent_any = False
     for chat_id in targets:
         try:
-            sent = await bot.send_message(chat_id, text, disable_web_page_preview=False)
+            sent = await notify_bot.send_message(chat_id, text, disable_web_page_preview=False)
             settings = monitor_cleanup_settings()
             record_monitor_message(
                 chat_id,
@@ -1275,6 +1356,22 @@ async def admin_send_monitor(text: str, monitor_name: str) -> bool:
             sent_any = True
         except Exception:
             logger.exception("failed to send monitor notification chat_id=%s", chat_id)
+    return sent_any
+
+
+async def admin_send_group(text: str) -> bool:
+    targets = admin_notification_chat_ids()
+    notify_bot = role_bot_client(BOT_ROLE_GROUP)
+    if not notify_bot or not targets:
+        logger.error("admin_send_group called before bot/admin init: %s", text)
+        return False
+    sent_any = False
+    for chat_id in targets:
+        try:
+            await notify_bot.send_message(chat_id, text, disable_web_page_preview=False)
+            sent_any = True
+        except Exception:
+            logger.exception("failed to send group notification chat_id=%s", chat_id)
     return sent_any
 
 
@@ -1348,12 +1445,13 @@ async def relay_user_message_to_admin(
     message: Message,
     thread_id: int | None = None,
 ) -> tuple[int, int]:
-    if not bot:
+    relay_bot = role_bot_client(BOT_ROLE_RELAY)
+    if not relay_bot:
         raise RuntimeError("Bot 尚未初始化")
     identity = compact_admin_header(inbox_id, user_id, full_name, username, note)
     thread_kwargs = {"message_thread_id": thread_id} if thread_id is not None else {}
     if getattr(message, "text", None):
-        sent = await bot.send_message(
+        sent = await relay_bot.send_message(
             chat_id,
             merged_admin_payload(identity, message.text, 4096),
             **thread_kwargs,
@@ -1361,7 +1459,7 @@ async def relay_user_message_to_admin(
         message_id = int(sent.message_id)
         return message_id, message_id
     if getattr(message, "photo", None):
-        sent = await bot.send_photo(
+        sent = await relay_bot.send_photo(
             chat_id,
             message.photo[-1].file_id,
             caption=merged_admin_payload(identity, getattr(message, "caption", None), 1024),
@@ -1370,7 +1468,7 @@ async def relay_user_message_to_admin(
         message_id = int(sent.message_id)
         return message_id, message_id
     if getattr(message, "document", None):
-        sent = await bot.send_document(
+        sent = await relay_bot.send_document(
             chat_id,
             message.document.file_id,
             caption=merged_admin_payload(identity, getattr(message, "caption", None), 1024),
@@ -1379,7 +1477,7 @@ async def relay_user_message_to_admin(
         message_id = int(sent.message_id)
         return message_id, message_id
     if getattr(message, "video", None):
-        sent = await bot.send_video(
+        sent = await relay_bot.send_video(
             chat_id,
             message.video.file_id,
             caption=merged_admin_payload(identity, getattr(message, "caption", None), 1024),
@@ -1388,7 +1486,7 @@ async def relay_user_message_to_admin(
         message_id = int(sent.message_id)
         return message_id, message_id
     if getattr(message, "audio", None):
-        sent = await bot.send_audio(
+        sent = await relay_bot.send_audio(
             chat_id,
             message.audio.file_id,
             caption=merged_admin_payload(identity, getattr(message, "caption", None), 1024),
@@ -1397,7 +1495,7 @@ async def relay_user_message_to_admin(
         message_id = int(sent.message_id)
         return message_id, message_id
     if getattr(message, "voice", None):
-        sent = await bot.send_voice(
+        sent = await relay_bot.send_voice(
             chat_id,
             message.voice.file_id,
             caption=merged_admin_payload(identity, getattr(message, "caption", None), 1024),
@@ -1406,7 +1504,7 @@ async def relay_user_message_to_admin(
         message_id = int(sent.message_id)
         return message_id, message_id
     if getattr(message, "animation", None):
-        sent = await bot.send_animation(
+        sent = await relay_bot.send_animation(
             chat_id,
             message.animation.file_id,
             caption=merged_admin_payload(identity, getattr(message, "caption", None), 1024),
@@ -1414,7 +1512,7 @@ async def relay_user_message_to_admin(
         )
         message_id = int(sent.message_id)
         return message_id, message_id
-    sent = await bot.send_message(chat_id, identity, **thread_kwargs)
+    sent = await relay_bot.send_message(chat_id, identity, **thread_kwargs)
     copy_kwargs: dict[str, Any] = {"reply_to_message_id": sent.message_id}
     if thread_id is not None:
         copy_kwargs["message_thread_id"] = thread_id
@@ -1425,9 +1523,10 @@ async def relay_user_message_to_admin(
 async def send_text_to_user(user_id: int, text: str, source: str = "web") -> int:
     if is_blocked(user_id):
         raise ValueError(f"用户 {user_id} 已被封禁")
-    if not bot:
+    relay_bot = role_bot_client(BOT_ROLE_RELAY)
+    if not relay_bot:
         raise RuntimeError("Bot 尚未初始化")
-    sent = await bot.send_message(user_id, text.strip())
+    sent = await relay_bot.send_message(user_id, text.strip())
     create_outbox_message(user_id, text.strip(), source, sent.message_id, "text")
     logger.info("sent message to user_id=%s message_id=%s", user_id, sent.message_id)
     return int(sent.message_id)
@@ -1436,77 +1535,78 @@ async def send_text_to_user(user_id: int, text: str, source: str = "web") -> int
 async def send_message_to_user(user_id: int, message: Message, source: str = "tg:reply") -> int:
     if is_blocked(user_id):
         raise ValueError(f"用户 {user_id} 已被封禁")
-    if not bot:
+    relay_bot = role_bot_client(BOT_ROLE_RELAY)
+    if not relay_bot:
         raise RuntimeError("Bot 尚未初始化")
     sent: Any
     content_type = message_content_type(message)
     if getattr(message, "text", None):
-        sent = await bot.send_message(
+        sent = await relay_bot.send_message(
             user_id,
             message.text,
             entities=getattr(message, "entities", None),
         )
     elif getattr(message, "photo", None):
-        sent = await bot.send_photo(
+        sent = await relay_bot.send_photo(
             user_id,
             message.photo[-1].file_id,
             caption=getattr(message, "caption", None) or None,
             caption_entities=getattr(message, "caption_entities", None),
         )
     elif getattr(message, "document", None):
-        sent = await bot.send_document(
+        sent = await relay_bot.send_document(
             user_id,
             message.document.file_id,
             caption=getattr(message, "caption", None) or None,
             caption_entities=getattr(message, "caption_entities", None),
         )
     elif getattr(message, "video", None):
-        sent = await bot.send_video(
+        sent = await relay_bot.send_video(
             user_id,
             message.video.file_id,
             caption=getattr(message, "caption", None) or None,
             caption_entities=getattr(message, "caption_entities", None),
         )
     elif getattr(message, "audio", None):
-        sent = await bot.send_audio(
+        sent = await relay_bot.send_audio(
             user_id,
             message.audio.file_id,
             caption=getattr(message, "caption", None) or None,
             caption_entities=getattr(message, "caption_entities", None),
         )
     elif getattr(message, "voice", None):
-        sent = await bot.send_voice(
+        sent = await relay_bot.send_voice(
             user_id,
             message.voice.file_id,
             caption=getattr(message, "caption", None) or None,
             caption_entities=getattr(message, "caption_entities", None),
         )
     elif getattr(message, "video_note", None):
-        sent = await bot.send_video_note(
+        sent = await relay_bot.send_video_note(
             user_id,
             message.video_note.file_id,
             length=getattr(message.video_note, "length", None),
         )
     elif getattr(message, "sticker", None):
-        sent = await bot.send_sticker(
+        sent = await relay_bot.send_sticker(
             user_id,
             message.sticker.file_id,
         )
     elif getattr(message, "animation", None):
-        sent = await bot.send_animation(
+        sent = await relay_bot.send_animation(
             user_id,
             message.animation.file_id,
             caption=getattr(message, "caption", None) or None,
             caption_entities=getattr(message, "caption_entities", None),
         )
     elif getattr(message, "location", None):
-        sent = await bot.send_location(
+        sent = await relay_bot.send_location(
             user_id,
             latitude=message.location.latitude,
             longitude=message.location.longitude,
         )
     elif getattr(message, "contact", None):
-        sent = await bot.send_contact(
+        sent = await relay_bot.send_contact(
             user_id,
             phone_number=message.contact.phone_number,
             first_name=message.contact.first_name,
@@ -1537,7 +1637,7 @@ async def copy_message_to_user(user_id: int, message: Message, source: str = "tg
 
 def is_admin_chat(message: Message) -> bool:
     """Dynamic admin-chat filter."""
-    return message.chat.id in recognized_admin_chat_ids()
+    return role_token_matches_message(message, BOT_ROLE_RELAY) and message.chat.id in recognized_admin_chat_ids()
 
 
 def is_admin_action_message(message: Message) -> bool:
@@ -1559,6 +1659,8 @@ def is_admin_action_message(message: Message) -> bool:
 
 @router.message(Command("start"))
 async def start(message: Message) -> None:
+    if not role_token_matches_message(message, BOT_ROLE_RELAY):
+        return
     uid, full, username = user_display(message)
     if not uid:
         return
@@ -1753,7 +1855,10 @@ async def admin_reply_by_message(message: Message) -> None:
                     pending_sendpic.pop(pending_key, None)
                     await message.reply(f"错误：用户 {target} 已被封禁，先 /unblock {target}")
                     return
-                sent = await bot.send_photo(target, message.photo[-1].file_id, caption=caption or None)  # type: ignore[union-attr]
+                relay_bot = role_bot_client(BOT_ROLE_RELAY)
+                if not relay_bot:
+                    raise RuntimeError("Bot 尚未初始化")
+                sent = await relay_bot.send_photo(target, message.photo[-1].file_id, caption=caption or None)  # type: ignore[union-attr]
                 create_outbox_message(
                     target,
                     caption or "[图片]",
@@ -1806,12 +1911,15 @@ async def admin_plain_message(message: Message) -> None:
 
 @router.message()
 async def user_message(message: Message) -> None:
-    # Only relay private user chats to admin.
+    # Relay private chats only on the relay bot; handle group listening only on the group bot.
     logger.info("incoming message chat_id=%s chat_type=%s from_user=%s content_type=%s text=%r", message.chat.id, message.chat.type, getattr(message.from_user, 'id', None), message.content_type, (message.text or '')[:80])
     if is_admin_chat(message):
         logger.info("incoming message is admin plain message; ignored by user relay")
         return
     if message.chat.type != "private":
+        if not role_token_matches_message(message, BOT_ROLE_GROUP):
+            logger.info("incoming group message ignored because current bot does not handle group listener role")
+            return
         if message.chat.type in {"group", "supergroup"}:
             try:
                 record_discovered_group_chat(message)
@@ -1819,6 +1927,9 @@ async def user_message(message: Message) -> None:
             except Exception:
                 logger.exception("group keyword handling failed chat_id=%s message_id=%s", message.chat.id, message.message_id)
         logger.info("incoming message ignored because chat_type is not private: %s", message.chat.type)
+        return
+    if not role_token_matches_message(message, BOT_ROLE_RELAY):
+        logger.info("incoming private message ignored because current bot does not handle relay role")
         return
     uid, full, username = user_display(message)
     if not uid:
@@ -2242,8 +2353,9 @@ async def cleanup_monitor_loop() -> None:
         try:
             state_n, sent_n = 0, 0
             message_n = 0
-            if bot:
-                message_n = await delete_expired_monitor_messages(bot)
+            monitor_client = role_bot_client(BOT_ROLE_MONITOR)
+            if monitor_client:
+                message_n = await delete_expired_monitor_messages(monitor_client)
             interval_seconds = int(settings["interval_minutes"]) * 60
             if time.time() - last_data_cleanup_ts >= interval_seconds:
                 state_n, sent_n = cleanup_monitor_data(int(settings["retention_minutes"]))
@@ -2258,7 +2370,8 @@ async def cleanup_monitor_loop() -> None:
 
 
 async def flush_pending_inbox() -> None:
-    if not bot or not relay_admin_chat_ids():
+    relay_bot = role_bot_client(BOT_ROLE_RELAY)
+    if not relay_bot or not relay_admin_chat_ids():
         return
     rows = pending_inbox(50)
     if not rows:
@@ -2286,12 +2399,12 @@ async def flush_pending_inbox() -> None:
                     str(row["full_name"] or row["user_id"]),
                     str(row["username"] or "") or None,
                 )
-                sent = await bot.send_message(group_id, text, message_thread_id=thread_id)
+                sent = await relay_bot.send_message(group_id, text, message_thread_id=thread_id)
                 save_message_map(group_id, sent.message_id, int(row['user_id']), int(row['user_message_id']) if row['user_message_id'] else None)
                 first_id = sent.message_id
             else:
                 for chat_id in relay_admin_chat_ids():
-                    sent = await bot.send_message(chat_id, text)
+                    sent = await relay_bot.send_message(chat_id, text)
                     save_message_map(chat_id, sent.message_id, int(row['user_id']), int(row['user_message_id']) if row['user_message_id'] else None)
                     first_id = first_id or sent.message_id
             mark_inbox_forwarded(int(row['id']), first_id, None)
@@ -2407,6 +2520,9 @@ def env_values() -> dict[str, str]:
     load_dotenv(ENV_PATH, override=True)
     return {
         "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
+        "RELAY_BOT_TOKEN": os.getenv("RELAY_BOT_TOKEN", ""),
+        "MONITOR_BOT_TOKEN": os.getenv("MONITOR_BOT_TOKEN", ""),
+        "GROUP_BOT_TOKEN": os.getenv("GROUP_BOT_TOKEN", ""),
         "ADMIN_CHAT_ID": os.getenv("ADMIN_CHAT_ID", ""),
         "ADMIN_ROUTE_MODE": os.getenv("ADMIN_ROUTE_MODE", "direct"),
         "ADMIN_FORUM_GROUP_ID": os.getenv("ADMIN_FORUM_GROUP_ID", ""),
@@ -2434,6 +2550,9 @@ def write_env_values(values: dict[str, str]) -> None:
     lines = [
         "# tg-watchbot environment",
         f"TELEGRAM_BOT_TOKEN={values.get('TELEGRAM_BOT_TOKEN','')}",
+        f"RELAY_BOT_TOKEN={values.get('RELAY_BOT_TOKEN','')}",
+        f"MONITOR_BOT_TOKEN={values.get('MONITOR_BOT_TOKEN','')}",
+        f"GROUP_BOT_TOKEN={values.get('GROUP_BOT_TOKEN','')}",
         f"ADMIN_CHAT_ID={values.get('ADMIN_CHAT_ID','')}",
         f"ADMIN_ROUTE_MODE={values.get('ADMIN_ROUTE_MODE','direct')}",
         f"ADMIN_FORUM_GROUP_ID={values.get('ADMIN_FORUM_GROUP_ID','')}",
@@ -3283,9 +3402,11 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         v = env_values()
         cleanup = (cfg_load_fresh().get("cleanup") or {})
         bot_ready = bot_env_configured()
-        status = "" if bot_ready else "<div class=msg>未完成 Bot 配置；网页可用，但 Bot 和监控推送不可用。direct 模式需要 ADMIN_CHAT_ID，forum_topic 模式需要 ADMIN_FORUM_GROUP_ID。</div>"
+        status = "" if bot_ready else "<div class=msg>未完成 Bot 配置；网页可用，但至少需要一个角色 Bot Token 和管理员路由后，双向机器人 / 监控 / 群监听才会生效。direct 模式需要 ADMIN_CHAT_ID，forum_topic 模式需要 ADMIN_FORUM_GROUP_ID。</div>"
         body = f"""<h2>Bot / 面板设置</h2>{status}<div class=card><form method=post>
-<label>Telegram Bot Token</label><input name=TELEGRAM_BOT_TOKEN value='{html_escape(v['TELEGRAM_BOT_TOKEN'])}' placeholder='123456:ABC...'>
+<label>共享 Telegram Bot Token</label><input name=TELEGRAM_BOT_TOKEN value='{html_escape(v['TELEGRAM_BOT_TOKEN'])}' placeholder='留空则仅使用下面的角色专用 Token；填写后可作为三类角色的默认回退 Token'>
+<h3>角色 Bot Token（可选覆盖）</h3><p class=muted>留空则继承上面的共享 Token。Relay=双向机器人，Monitor=监控推送，Group=群监听。</p>
+<div class=grid><div><label>RELAY_BOT_TOKEN</label><input name=RELAY_BOT_TOKEN value='{html_escape(v['RELAY_BOT_TOKEN'])}' placeholder='双向机器人专用'></div><div><label>MONITOR_BOT_TOKEN</label><input name=MONITOR_BOT_TOKEN value='{html_escape(v['MONITOR_BOT_TOKEN'])}' placeholder='监控推送专用'></div><div><label>GROUP_BOT_TOKEN</label><input name=GROUP_BOT_TOKEN value='{html_escape(v['GROUP_BOT_TOKEN'])}' placeholder='群监听专用'></div></div>
 <div class=grid><div><label>管理员路由模式</label><select name=ADMIN_ROUTE_MODE><option value='direct' {'selected' if v['ADMIN_ROUTE_MODE'] == 'direct' else ''}>direct 直发管理员</option><option value='forum_topic' {'selected' if v['ADMIN_ROUTE_MODE'] == 'forum_topic' else ''}>forum_topic 私有超级群 Topic</option></select></div><div><label>管理员 ADMIN_CHAT_ID</label><input name=ADMIN_CHAT_ID value='{html_escape(v['ADMIN_CHAT_ID'])}' placeholder='直发模式可填最多 3 个，逗号分隔'></div></div>
 <label>ADMIN_FORUM_GROUP_ID（私有超级群 ID）</label><input name=ADMIN_FORUM_GROUP_ID value='{html_escape(v['ADMIN_FORUM_GROUP_ID'])}' placeholder='forum_topic 模式必填，例如 -1001234567890'>
 <h3>TG 用户会话（可选）</h3><p class=muted>仅用于“TG 群监听 -> 监听来源=用户会话”，适合 Bot 无法加入的群。填写后需重启。</p>
@@ -3313,7 +3434,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         cfg_save(cfg)
 
     @app.post("/settings", response_class=HTMLResponse)
-    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), ADMIN_ROUTE_MODE: str = Form("direct"), ADMIN_FORUM_GROUP_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440)) -> str:
+    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), RELAY_BOT_TOKEN: str = Form(""), MONITOR_BOT_TOKEN: str = Form(""), GROUP_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), ADMIN_ROUTE_MODE: str = Form("direct"), ADMIN_FORUM_GROUP_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440)) -> str:
         save_panel_settings(locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED}, CLEANUP_INTERVAL_MINUTES, CLEANUP_MESSAGE_DELETE_AFTER_MINUTES, CLEANUP_RETENTION_MINUTES)
         return layout("已保存", "<div class=msg>已保存，不会自动重启；修改 Token/管理员 ID 后请重启。</div><p><a class=btn href='/settings'>返回</a> <a class=btn href='/restart'>重启机器人</a></p>")
 
@@ -3437,8 +3558,9 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
             action = "unblock" if u["blocked"] else "block"
             action_txt = "解封" if u["blocked"] else "封禁"
             trs.append(f"""<tr><td><b>{html_escape(u['full_name'] or u['user_id'])}</b><br><small>{u['user_id']} @{html_escape(u['username'] or '')}</small></td><td><span class=badge>{status_txt}</span><br><small>{html_escape(u['updated_at'])}</small></td><td>{html_escape(u['note'] or '')}</td><td><form method=post action='/users/{u['user_id']}/note'><input name=note value='{html_escape(u['note'] or '')}'><button class=btn type=submit>备注</button></form><div class=actions><a class=btn href='/send?user_id={u['user_id']}'>发消息</a><a class='btn danger' href='/users/{u['user_id']}/{action}'>{action_txt}</a></div></td></tr>""")
-        settings_card = f"""<div class=card><h2>Bot / 面板配置</h2><p class=muted>这里和“Bot / 面板设置”共用同一份 .env。修改 Token、管理员 ID、端口、账号或密码后不会自动重启，需要手动重启服务。</p><form method=post action='/users/settings'>
-<label>Telegram Bot Token</label><input name=TELEGRAM_BOT_TOKEN value='{html_escape(v['TELEGRAM_BOT_TOKEN'])}' placeholder='123456:ABC...'>
+        settings_card = f"""<div class=card><h2>Bot / 面板配置</h2><p class=muted>这里和“Bot / 面板设置”共用同一份 .env。可为双向机器人、监控推送、群监听分别填写不同 Token；留空则继承共享 Token。修改后不会自动重启，需要手动重启服务。</p><form method=post action='/users/settings'>
+<label>共享 Telegram Bot Token</label><input name=TELEGRAM_BOT_TOKEN value='{html_escape(v['TELEGRAM_BOT_TOKEN'])}' placeholder='123456:ABC...'>
+<div class=grid><div><label>RELAY_BOT_TOKEN</label><input name=RELAY_BOT_TOKEN value='{html_escape(v['RELAY_BOT_TOKEN'])}'></div><div><label>MONITOR_BOT_TOKEN</label><input name=MONITOR_BOT_TOKEN value='{html_escape(v['MONITOR_BOT_TOKEN'])}'></div><div><label>GROUP_BOT_TOKEN</label><input name=GROUP_BOT_TOKEN value='{html_escape(v['GROUP_BOT_TOKEN'])}'></div></div>
 <div class=grid><div><label>管理员路由模式</label><select name=ADMIN_ROUTE_MODE><option value='direct' {'selected' if v['ADMIN_ROUTE_MODE'] == 'direct' else ''}>direct 直发管理员</option><option value='forum_topic' {'selected' if v['ADMIN_ROUTE_MODE'] == 'forum_topic' else ''}>forum_topic 私有超级群 Topic</option></select></div><div><label>管理员 ADMIN_CHAT_ID</label><input name=ADMIN_CHAT_ID value='{html_escape(v['ADMIN_CHAT_ID'])}'></div></div>
 <label>ADMIN_FORUM_GROUP_ID（私有超级群 ID）</label><input name=ADMIN_FORUM_GROUP_ID value='{html_escape(v['ADMIN_FORUM_GROUP_ID'])}'>
 <h3>TG 用户会话（可选）</h3><p class=muted>仅用于 TG 群监听来源=用户会话。修改后需重启。</p>
@@ -3450,7 +3572,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         return layout("用户管理", body)
 
     @app.post("/users/settings", response_class=HTMLResponse)
-    async def users_settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), ADMIN_ROUTE_MODE: str = Form("direct"), ADMIN_FORUM_GROUP_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin")) -> str:
+    async def users_settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), RELAY_BOT_TOKEN: str = Form(""), MONITOR_BOT_TOKEN: str = Form(""), GROUP_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), ADMIN_ROUTE_MODE: str = Form("direct"), ADMIN_FORUM_GROUP_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin")) -> str:
         cleanup = (cfg_load_fresh().get("cleanup") or {})
         save_panel_settings(
             locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED},
@@ -3680,35 +3802,77 @@ async def start_panel_server() -> uvicorn.Server | None:
     logger.info("web panel listening on http://%s:%s", host, port)
     return server
 
-def validate_env() -> tuple[str, int]:
-    load_dotenv(ENV_PATH)
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+def validate_route_env() -> int:
+    load_dotenv(ENV_PATH, override=True)
     admin = os.getenv("ADMIN_CHAT_ID", "").strip()
-    if not token:
-        raise RuntimeError(f"TELEGRAM_BOT_TOKEN is missing in {ENV_PATH}")
     ids = parse_admin_chat_ids(admin) if admin else []
     if admin_route_mode() == "forum_topic":
         group_id = admin_forum_group_id()
         if group_id is None:
             raise RuntimeError(f"ADMIN_FORUM_GROUP_ID is missing or invalid in {ENV_PATH}")
-        return token, ids[0] if ids else group_id
+        return ids[0] if ids else group_id
     if not ids:
         raise RuntimeError(f"ADMIN_CHAT_ID is missing or invalid in {ENV_PATH}")
-    return token, ids[0]
+    return ids[0]
 
 
 def bot_env_configured() -> bool:
-    load_dotenv(ENV_PATH, override=True)
-    token_ready = bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip())
-    if not token_ready:
-        return False
-    if admin_route_mode() == "forum_topic":
-        return admin_forum_group_id() is not None
-    return bool(os.getenv("ADMIN_CHAT_ID", "").strip())
+    return any([relay_bot_env_configured(), monitor_bot_env_configured(), group_bot_env_configured()])
+
+
+def configured_bot_roles() -> list[str]:
+    roles: list[str] = []
+    for role in [BOT_ROLE_RELAY, BOT_ROLE_MONITOR, BOT_ROLE_GROUP]:
+        if role_env_configured(role):
+            roles.append(role)
+    return roles
+
+
+def init_runtime_bots() -> list[Bot]:
+    global bot, monitor_bot, group_bot, admin_chat_id, admin_chat_ids
+    admin_chat_ids = parse_admin_chat_ids(os.getenv("ADMIN_CHAT_ID", ""))
+    admin_chat_id = validate_route_env() if notification_route_configured() else None
+    shared: dict[str, Bot] = {}
+    role_clients: dict[str, Bot | None] = {
+        BOT_ROLE_RELAY: None,
+        BOT_ROLE_MONITOR: None,
+        BOT_ROLE_GROUP: None,
+    }
+    for role in configured_bot_roles():
+        token = role_bot_token(role)
+        if not token:
+            continue
+        if token not in shared:
+            shared[token] = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        role_clients[role] = shared[token]
+    bot = role_clients[BOT_ROLE_RELAY]
+    monitor_bot = role_clients[BOT_ROLE_MONITOR]
+    group_bot = role_clients[BOT_ROLE_GROUP]
+    return list(shared.values())
+
+
+async def close_runtime_bots(bot_clients: list[Bot]) -> None:
+    for client in bot_clients:
+        try:
+            await client.session.close()
+        except Exception:
+            logger.exception("failed to close bot session")
+
+
+async def run_polling_for_bot(client: Bot) -> None:
+    dp = Dispatcher()
+    dp.include_router(router)
+    roles = []
+    token = str(getattr(client, "token", "") or "")
+    for role in [BOT_ROLE_RELAY, BOT_ROLE_GROUP]:
+        if role_env_configured(role) and role_bot_token(role) == token:
+            roles.append(role)
+    logger.info("bot polling start roles=%s", ",".join(roles) or "unknown")
+    await dp.start_polling(client, allowed_updates=dp.resolve_used_update_types())
 
 
 async def main_async(run_once: bool = False, panel_only: bool = False) -> None:
-    global bot, admin_chat_id, admin_chat_ids, config, scheduler_ref, user_session_listener_task
+    global bot, monitor_bot, group_bot, admin_chat_id, admin_chat_ids, config, scheduler_ref, user_session_listener_task
     load_dotenv(ENV_PATH, override=True)
     config = load_config()
     setup_logging(os.getenv("LOG_LEVEL", "INFO"))
@@ -3720,33 +3884,28 @@ async def main_async(run_once: bool = False, panel_only: bool = False) -> None:
             await asyncio.sleep(3600)
     if run_once:
         # If .env is filled, send notifications during manual test; otherwise just log.
+        runtime_bots: list[Bot] = []
         try:
-            token, admin_chat_id = validate_env()
-            admin_chat_ids = parse_admin_chat_ids(os.getenv("ADMIN_CHAT_ID", ""))
-            bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+            runtime_bots = init_runtime_bots()
         except Exception as e:
             logger.warning("run-once without Telegram notification: %s", e)
         await run_all_monitors_once()
-        if bot:
-            await bot.session.close()
+        await close_runtime_bots(runtime_bots)
         return
     await start_panel_server()
     if not bot_env_configured():
         logger.warning(
-            "Telegram bot is not configured. Web panel is available, but Telegram polling, monitor notifications, and admin/user messaging will not work until TELEGRAM_BOT_TOKEN and ADMIN_CHAT_ID are saved, then the service is restarted."
+            "Telegram bot is not configured. Web panel is available, but Telegram polling, monitor notifications, and admin/user messaging will not work until at least one role bot token and admin route are saved, then the service is restarted."
         )
         while True:
             await asyncio.sleep(3600)
-    token, admin_chat_id = validate_env()
-    admin_chat_ids = parse_admin_chat_ids(os.getenv("ADMIN_CHAT_ID", ""))
-    bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher()
-    dp.include_router(router)
+    runtime_bots = init_runtime_bots()
     scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
     scheduler_ref = scheduler
     schedule_monitors(scheduler)
     scheduler.start()
-    asyncio.create_task(flush_pending_loop())
+    if role_env_configured(BOT_ROLE_RELAY):
+        asyncio.create_task(flush_pending_loop())
     asyncio.create_task(cleanup_monitor_loop())
     if group_monitors_need_user_session():
         if TelegramClient is None:
@@ -3757,9 +3916,24 @@ async def main_async(run_once: bool = False, panel_only: bool = False) -> None:
             )
         else:
             user_session_listener_task = asyncio.create_task(run_user_session_group_listener())
-    await admin_send(f"tg-watchbot 已启动\n时间：{now_iso()}")
-    logger.info("bot polling start")
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    if role_env_configured(BOT_ROLE_RELAY):
+        await admin_send(f"tg-watchbot 已启动\n时间：{now_iso()}")
+    polling_clients: list[Bot] = []
+    seen_tokens: set[str] = set()
+    for role in [BOT_ROLE_RELAY, BOT_ROLE_GROUP]:
+        if not role_env_configured(role):
+            continue
+        client = role_bot_client(role)
+        token = str(getattr(client, "token", "") or "")
+        if client is None or not token or token in seen_tokens:
+            continue
+        seen_tokens.add(token)
+        polling_clients.append(client)
+    if not polling_clients:
+        logger.info("no polling bots configured; background monitor and panel tasks remain active")
+        while True:
+            await asyncio.sleep(3600)
+    await asyncio.gather(*(run_polling_for_bot(client) for client in polling_clients))
 
 
 def main() -> None:

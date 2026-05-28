@@ -18,6 +18,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 普通用户私聊 Bot，消息会转发给管理员，或转发到私有超级群的 Forum Topic；
 - 管理员可以直接回复、主动发文字/图片、并通过“回复用户消息”回传文字、图片、文件、视频等常见媒体；
 - 后台定时监控 RSS 或网页，命中关键词、新条目、价格/库存变化后推送给管理员；
+- 支持把双向机器人、监控推送、群监听拆成 3 个独立 Bot，也支持共用同一个 Bot Token；
 - 自带一个 Web 管理面板，可配置监控目标、编辑 YAML、查看收件箱和日志。
 
 项目为单文件应用，适合个人服务器、NAT 小鸡、轻量 VPS 直接用 systemd 跑。
@@ -25,7 +26,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 
 ## AI 一句话安装
 ```
-请克隆 `https://github.com/GongyiChuren/tg-watchbot.git` 到本机，默认使用 Docker 按 README 的 `Docker 安装（含自启）` 启动服务；若无 Docker，则按 `快速开始` 走 Python 和 systemd 部署直接安装。启动后打开 `http://127.0.0.1:8765`，安装完成后提醒用户记得在面板填写 `TELEGRAM_BOT_TOKEN`，然后二选一：`direct` 模式填写 `ADMIN_CHAT_ID`，或 `forum_topic` 模式填写 `ADMIN_FORUM_GROUP_ID`；保存后执行重启（Docker 用 `docker compose restart`，直接安装用重启进程）。
+请克隆 `https://github.com/GongyiChuren/tg-watchbot.git` 到本机，默认使用 Docker 按 README 的 `Docker 安装（含自启）` 启动服务；若无 Docker，则按 `快速开始` 走 Python 和 systemd 部署直接安装。启动后打开 `http://127.0.0.1:8765`，安装完成后先填写管理员路由：`direct` 模式填写 `ADMIN_CHAT_ID`，或 `forum_topic` 模式填写 `ADMIN_FORUM_GROUP_ID`；然后二选一：只填共享 `TELEGRAM_BOT_TOKEN`，或分别填写 `RELAY_BOT_TOKEN` / `MONITOR_BOT_TOKEN` / `GROUP_BOT_TOKEN`；保存后执行重启（Docker 用 `docker compose restart`，直接安装用重启进程）。
 ``` 
 ## 更新日志
 
@@ -52,7 +53,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 
 ### 2026-05-21 第一次更新
 
-- 默认启动改为先启动 Web 面板：未填写 `TELEGRAM_BOT_TOKEN` / `ADMIN_CHAT_ID` 时，面板仍可打开，同时 Telegram 收发、监控推送不可用。
+- 默认启动改为先启动 Web 面板：未填写任何角色 Bot Token 或管理员路由前，面板仍可打开，同时 Telegram 收发、监控推送不可用。
 - 面板配置页可填写 Bot Token、管理员 ID、面板账号和清理策略；保存后需要重启服务让 Bot 配置生效。
 - 修复到期消息删除：监控推送消息支持到期自动删除，默认 `60` 分钟。
 - 保存配置时会保留 `WEB_PANEL_SESSION_SECRET`，避免保存后登录状态被重置。
@@ -67,6 +68,11 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 用户消息先写入 SQLite，再转发给管理员，避免转发失败时丢消息。
 - 管理员可通过“回复转发消息”直接回给原用户；回复时支持文字、图片、文件、视频、语音、贴纸、位置、联系人等常见内容。
 - 默认使用精简提示：文本消息会合并成单条“身份 + 空行 + 内容”；图片/文件/视频/语音等可带 caption 的媒体也会尽量合并成单条；成功转发/回复默认静默，只有失败时才提示。
+- 可把三条链路拆开配置：
+  - `RELAY_BOT_TOKEN`：双向机器人、管理员回复、Web 主动发信；
+  - `MONITOR_BOT_TOKEN`：RSS / Web 监控推送；
+  - `GROUP_BOT_TOKEN`：TG 群监听命中推送；
+  - 留空时会回退到共享 `TELEGRAM_BOT_TOKEN`。
 - `forum_topic` 模式下，管理员在 Topic 内回复的媒体消息会按类型重新发送到用户私聊，规避 Telegram 对群内消息直接复制的限制。
 - 如果 `forum_topic` 模式下同时填写了 `ADMIN_CHAT_ID`，用户私聊也会镜像一份到这些管理员 chat，方便个人提醒和直接回复。
 - 支持两种管理员路由：
@@ -306,7 +312,10 @@ curl http://127.0.0.1:8765/health
 
 | 变量 | 说明 |
 |---|---|
-| `TELEGRAM_BOT_TOKEN` | BotFather 创建的 Telegram Bot Token |
+| `TELEGRAM_BOT_TOKEN` | 共享 Telegram Bot Token；作为三类角色的默认回退值 |
+| `RELAY_BOT_TOKEN` | （可选）双向机器人专用 Token；留空则继承 `TELEGRAM_BOT_TOKEN` |
+| `MONITOR_BOT_TOKEN` | （可选）监控推送专用 Token；留空则继承 `TELEGRAM_BOT_TOKEN` |
+| `GROUP_BOT_TOKEN` | （可选）TG 群监听专用 Token；留空则继承 `TELEGRAM_BOT_TOKEN` |
 | `ADMIN_CHAT_ID` | `direct` 模式下的管理员 Telegram 数字 chat id；最多 3 个，用逗号分隔 |
 | `ADMIN_ROUTE_MODE` | 管理员路由模式：`direct` 或 `forum_topic` |
 | `ADMIN_FORUM_GROUP_ID` | `forum_topic` 模式下的私有超级群 ID，Bot 需要在群里且已开启 Topics |
