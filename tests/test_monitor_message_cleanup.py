@@ -305,28 +305,70 @@ class MonitorMessageCleanupTest(unittest.TestCase):
         self.assertEqual((1001, 3003, 2001, 4004), row)
 
     def test_expired_monitor_message_is_deleted_and_removed_from_queue(self) -> None:
+        old_config = app.config
         app.record_monitor_message(1001, 2002, "NodeSeek 新帖", delete_after_seconds=60, sent_at_ts=1000)
+        app.config = {"cleanup": {"monitor_message_delete_mode": "ttl"}}
 
         fake_bot = FakeBot()
-        deleted_count = asyncio.run(app.delete_expired_monitor_messages(fake_bot, now_ts=1061))
+        try:
+            deleted_count = asyncio.run(app.delete_expired_monitor_messages(fake_bot, now_ts=1061))
 
-        self.assertEqual(1, deleted_count)
-        self.assertEqual([(1001, 2002)], fake_bot.deleted)
-        with closing(sqlite3.connect(app.DB_PATH)) as conn:
-            remaining = conn.execute("SELECT COUNT(*) FROM monitor_messages").fetchone()[0]
-        self.assertEqual(0, remaining)
+            self.assertEqual(1, deleted_count)
+            self.assertEqual([(1001, 2002)], fake_bot.deleted)
+            with closing(sqlite3.connect(app.DB_PATH)) as conn:
+                remaining = conn.execute("SELECT COUNT(*) FROM monitor_messages").fetchone()[0]
+            self.assertEqual(0, remaining)
+        finally:
+            app.config = old_config
 
     def test_unexpired_monitor_message_is_kept(self) -> None:
+        old_config = app.config
         app.record_monitor_message(1001, 2002, "NodeSeek 新帖", delete_after_seconds=60, sent_at_ts=1000)
+        app.config = {"cleanup": {"monitor_message_delete_mode": "ttl"}}
 
         fake_bot = FakeBot()
-        deleted_count = asyncio.run(app.delete_expired_monitor_messages(fake_bot, now_ts=1059))
+        try:
+            deleted_count = asyncio.run(app.delete_expired_monitor_messages(fake_bot, now_ts=1059))
 
-        self.assertEqual(0, deleted_count)
-        self.assertEqual([], fake_bot.deleted)
-        with closing(sqlite3.connect(app.DB_PATH)) as conn:
-            remaining = conn.execute("SELECT COUNT(*) FROM monitor_messages").fetchone()[0]
-        self.assertEqual(1, remaining)
+            self.assertEqual(0, deleted_count)
+            self.assertEqual([], fake_bot.deleted)
+            with closing(sqlite3.connect(app.DB_PATH)) as conn:
+                remaining = conn.execute("SELECT COUNT(*) FROM monitor_messages").fetchone()[0]
+            self.assertEqual(1, remaining)
+        finally:
+            app.config = old_config
+
+    def test_after_read_mode_keeps_unread_monitor_message(self) -> None:
+        old_config = app.config
+        app.record_monitor_message(1001, 2002, "NodeSeek 新帖", delete_after_seconds=60, sent_at_ts=1000)
+        app.config = {"cleanup": {"monitor_message_delete_mode": "after_read"}}
+
+        fake_bot = FakeBot()
+        try:
+            deleted_count = asyncio.run(app.delete_expired_monitor_messages(fake_bot, now_ts=5000))
+            self.assertEqual(0, deleted_count)
+            self.assertEqual([], fake_bot.deleted)
+            with closing(sqlite3.connect(app.DB_PATH)) as conn:
+                row = conn.execute(
+                    "SELECT read_at FROM monitor_messages WHERE chat_id=1001 AND message_id=2002"
+                ).fetchone()
+            self.assertEqual((None,), row)
+        finally:
+            app.config = old_config
+
+    def test_after_read_mode_deletes_after_mark_read(self) -> None:
+        old_config = app.config
+        app.record_monitor_message(1001, 2002, "NodeSeek 新帖", delete_after_seconds=60, sent_at_ts=1000)
+        app.mark_monitor_message_read(1001, 2002, "1970-01-01T00:20:00+00:00")
+        app.config = {"cleanup": {"monitor_message_delete_mode": "after_read"}}
+
+        fake_bot = FakeBot()
+        try:
+            deleted_count = asyncio.run(app.delete_expired_monitor_messages(fake_bot, now_ts=1261))
+            self.assertEqual(1, deleted_count)
+            self.assertEqual([(1001, 2002)], fake_bot.deleted)
+        finally:
+            app.config = old_config
 
     def test_copy_message_to_user_records_media_log(self) -> None:
         old_bot = app.bot

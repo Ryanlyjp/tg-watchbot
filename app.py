@@ -106,6 +106,7 @@ def load_config() -> dict[str, Any]:
 
 def monitor_cleanup_settings() -> dict[str, int | bool]:
     cleanup = (config.get("cleanup") or {}) if isinstance(config, dict) else {}
+    mode = str(cleanup.get("monitor_message_delete_mode", "ttl")).strip().lower()
     return {
         "enabled": bool(cleanup.get("enabled", True)),
         "interval_minutes": max(1, int(cleanup.get("interval_minutes", 60))),
@@ -119,6 +120,7 @@ def monitor_cleanup_settings() -> dict[str, int | bool]:
                 )
             ),
         ),
+        "message_delete_mode": mode if mode in {"ttl", "after_read"} else "ttl",
     }
 
 
@@ -173,6 +175,7 @@ def init_db() -> None:
                 monitor_name TEXT NOT NULL,
                 sent_at TEXT NOT NULL,
                 delete_after_seconds INTEGER NOT NULL,
+                read_at TEXT,
                 delete_error TEXT,
                 PRIMARY KEY (chat_id, message_id)
             );
@@ -250,6 +253,7 @@ def init_db() -> None:
         for sql in [
             "ALTER TABLE inbox_messages ADD COLUMN direction TEXT DEFAULT 'in'",
             "ALTER TABLE inbox_messages ADD COLUMN source TEXT DEFAULT 'user'",
+            "ALTER TABLE monitor_messages ADD COLUMN read_at TEXT",
         ]:
             try:
                 conn.execute(sql)
@@ -2210,8 +2214,8 @@ def record_monitor_message(
         conn.execute(
             """
             INSERT OR REPLACE INTO monitor_messages(
-                chat_id, message_id, monitor_name, sent_at, delete_after_seconds, delete_error
-            ) VALUES(?,?,?,?,?,NULL)
+                chat_id, message_id, monitor_name, sent_at, delete_after_seconds, read_at, delete_error
+            ) VALUES(?,?,?,?,?,?,NULL)
             """,
             (
                 chat_id,
@@ -2219,21 +2223,63 @@ def record_monitor_message(
                 monitor_name,
                 sent_at,
                 max(1, int(delete_after_seconds)),
+                None,
             ),
         )
         conn.commit()
 
 
+def list_monitor_messages(limit: int = 200) -> list[sqlite3.Row]:
+    with closing(db()) as conn:
+        return list(
+            conn.execute(
+                """
+                SELECT chat_id, message_id, monitor_name, sent_at, read_at, delete_after_seconds, delete_error
+                FROM monitor_messages
+                ORDER BY sent_at DESC, chat_id DESC, message_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        )
+
+
+def mark_monitor_message_read(chat_id: int, message_id: int, read_at: str | None = None) -> None:
+    with closing(db()) as conn:
+        conn.execute(
+            "UPDATE monitor_messages SET read_at=?, delete_error=NULL WHERE chat_id=? AND message_id=?",
+            (read_at or now_iso(), chat_id, message_id),
+        )
+        conn.commit()
+
+
+def mark_all_monitor_messages_read(read_at: str | None = None) -> int:
+    with closing(db()) as conn:
+        cur = conn.execute(
+            "UPDATE monitor_messages SET read_at=?, delete_error=NULL WHERE read_at IS NULL",
+            (read_at or now_iso(),),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
 async def delete_expired_monitor_messages(delete_bot: Any, now_ts: float | None = None) -> int:
     now_value = time.time() if now_ts is None else now_ts
+    settings = monitor_cleanup_settings()
+    mode = str(settings["message_delete_mode"])
     with closing(db()) as conn:
         rows = conn.execute(
-            "SELECT chat_id, message_id, sent_at, delete_after_seconds FROM monitor_messages"
+            "SELECT chat_id, message_id, sent_at, read_at, delete_after_seconds FROM monitor_messages"
         ).fetchall()
     deleted_count = 0
     for row in rows:
-        sent_at_ts = datetime.fromisoformat(row["sent_at"]).timestamp()
-        if sent_at_ts + int(row["delete_after_seconds"]) > now_value:
+        if mode == "after_read":
+            if not row["read_at"]:
+                continue
+            base_ts = datetime.fromisoformat(row["read_at"]).timestamp()
+        else:
+            base_ts = datetime.fromisoformat(row["sent_at"]).timestamp()
+        if base_ts + int(row["delete_after_seconds"]) > now_value:
             continue
         try:
             await delete_bot.delete_message(int(row["chat_id"]), int(row["message_id"]))
@@ -3414,6 +3460,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
 <label>TG_API_SESSION</label><textarea name=TG_API_SESSION placeholder='Telethon StringSession'>{html_escape(v['TG_API_SESSION'])}</textarea>
 <div class=grid><div><label>日志级别</label><input name=LOG_LEVEL value='{html_escape(v['LOG_LEVEL'])}'></div><div><label>面板监听地址</label><input name=WEB_PANEL_HOST value='{html_escape(v['WEB_PANEL_HOST'])}'></div><div><label>面板端口</label><input name=WEB_PANEL_PORT value='{html_escape(v['WEB_PANEL_PORT'])}'></div><div><label>面板用户</label><input name=WEB_PANEL_USER value='{html_escape(v['WEB_PANEL_USER'])}'></div><div><label>面板密码</label><input name=WEB_PANEL_PASSWORD value='{html_escape(v['WEB_PANEL_PASSWORD'])}'></div></div>
 <h3>监控数据自动清理</h3><p class=muted>删除过期监控通知消息，并清理 RSS/网站监控状态和去重记录；不会删除用户、收件箱、双向对话消息。</p><div class=grid><div><label>清理间隔（分钟）</label><input name=CLEANUP_INTERVAL_MINUTES type=number min=1 value='{html_escape(cleanup.get("interval_minutes", 60))}'></div><div><label>监控通知删除时间（分钟）</label><input name=CLEANUP_MESSAGE_DELETE_AFTER_MINUTES type=number min=1 value='{html_escape(cleanup.get("monitor_message_delete_after_minutes", 60))}'></div><div><label>保留监控数据（分钟）</label><input name=CLEANUP_RETENTION_MINUTES type=number min=1 value='{html_escape(cleanup.get("monitor_retention_minutes", 1440))}'></div></div>
+<div class=grid><div><label>监控通知删除模式</label><select name=CLEANUP_MESSAGE_DELETE_MODE><option value='ttl' {'selected' if cleanup.get("monitor_message_delete_mode", "ttl") == 'ttl' else ''}>发送后倒计时删除</option><option value='after_read' {'selected' if cleanup.get("monitor_message_delete_mode", "ttl") == 'after_read' else ''}>标记已读后倒计时删除</option></select></div><div><label>待清理通知队列</label><div class=form-actions><a class='btn' href='/monitor/messages'>打开队列管理</a></div></div></div>
 <input type=hidden name=WEB_PANEL_ENABLED value='true'><div class=form-actions><button class='btn primary' type=submit>保存设置</button></div><small>改 Token、管理员 ID 或端口后需要重启。</small></form></div>"""
         return layout("设置", body)
 
@@ -3422,6 +3469,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         cleanup_interval_minutes: int,
         cleanup_message_delete_after_minutes: int,
         cleanup_retention_minutes: int,
+        cleanup_message_delete_mode: str,
     ) -> None:
         write_env_values(values)
         cfg = cfg_load_fresh()
@@ -3430,12 +3478,13 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
             "interval_minutes": max(1, int(cleanup_interval_minutes)),
             "monitor_message_delete_after_minutes": max(1, int(cleanup_message_delete_after_minutes)),
             "monitor_retention_minutes": max(1, int(cleanup_retention_minutes)),
+            "monitor_message_delete_mode": cleanup_message_delete_mode if cleanup_message_delete_mode in {"ttl", "after_read"} else "ttl",
         }
         cfg_save(cfg)
 
     @app.post("/settings", response_class=HTMLResponse)
-    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), RELAY_BOT_TOKEN: str = Form(""), MONITOR_BOT_TOKEN: str = Form(""), GROUP_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), ADMIN_ROUTE_MODE: str = Form("direct"), ADMIN_FORUM_GROUP_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440)) -> str:
-        save_panel_settings(locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED}, CLEANUP_INTERVAL_MINUTES, CLEANUP_MESSAGE_DELETE_AFTER_MINUTES, CLEANUP_RETENTION_MINUTES)
+    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), RELAY_BOT_TOKEN: str = Form(""), MONITOR_BOT_TOKEN: str = Form(""), GROUP_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), ADMIN_ROUTE_MODE: str = Form("direct"), ADMIN_FORUM_GROUP_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440), CLEANUP_MESSAGE_DELETE_MODE: str = Form("ttl")) -> str:
+        save_panel_settings(locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED}, CLEANUP_INTERVAL_MINUTES, CLEANUP_MESSAGE_DELETE_AFTER_MINUTES, CLEANUP_RETENTION_MINUTES, CLEANUP_MESSAGE_DELETE_MODE)
         return layout("已保存", "<div class=msg>已保存，不会自动重启；修改 Token/管理员 ID 后请重启。</div><p><a class=btn href='/settings'>返回</a> <a class=btn href='/restart'>重启机器人</a></p>")
 
 
@@ -3579,6 +3628,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
             int(cleanup.get("interval_minutes", 60)),
             int(cleanup.get("monitor_message_delete_after_minutes", 60)),
             int(cleanup.get("monitor_retention_minutes", 1440)),
+            str(cleanup.get("monitor_message_delete_mode", "ttl")),
         )
         return layout("已保存", "<div class=msg>已保存，不会自动重启；修改 Token、管理员 ID、端口、账号或密码后请重启。</div><p><a class=btn href='/users'>返回用户管理</a> <a class=btn href='/restart'>重启机器人</a></p>")
 
@@ -3655,8 +3705,50 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         for r in rows:
             status_txt = "已推 TG" if r["pushed"] else "仅 Web"
             trs.append(f"""<tr><td>#{r['id']}<br><span class=badge>{status_txt}</span></td><td><b>{html_escape(r['monitor_name'])}</b><br><small>{html_escape(r['created_at'])}</small></td><td>{html_escape(r['title'])}<br><small>{html_escape(r['link'])}</small></td><td>{html_escape(r['reasons'])}</td></tr>""")
-        body = "<div class=card><h2>监控推送历史</h2><table><tr><th>ID/状态</th><th>监控</th><th>条目</th><th>原因</th></tr>" + "".join(trs) + "</table></div>"
+        body = "<div class=card><h2>监控推送历史</h2><p class=muted><a class='btn' href='/monitor/messages'>查看待清理通知</a></p><table><tr><th>ID/状态</th><th>监控</th><th>条目</th><th>原因</th></tr>" + "".join(trs) + "</table></div>"
         return layout("推送历史", body)
+
+    @app.get("/monitor/messages", response_class=HTMLResponse)
+    async def monitor_messages_page(_: str = Depends(panel_auth)) -> str:
+        cleanup = monitor_cleanup_settings()
+        rows = list_monitor_messages()
+        trs = []
+        for row in rows:
+            if row["read_at"]:
+                status_txt = f"已读：{html_escape(row['read_at'])}"
+                status_cls = "ok"
+            else:
+                status_txt = "未读"
+                status_cls = "danger"
+            mode_text = "已读后倒计时" if cleanup["message_delete_mode"] == "after_read" else "发送后倒计时"
+            actions = ""
+            if not row["read_at"]:
+                actions = f"<a class='btn primary' href='/monitor/messages/{row['chat_id']}/{row['message_id']}/read'>标记已读</a>"
+            trs.append(
+                f"""<tr><td><code>{row['chat_id']}</code><br><small>{row['message_id']}</small></td><td><b>{html_escape(row['monitor_name'])}</b><br><small>{html_escape(row['sent_at'])}</small></td><td><span class='badge {status_cls}'>{status_txt}</span><br><small>{html_escape(mode_text)} · {int(row['delete_after_seconds']) // 60} 分钟</small></td><td><small style='color:#fca5a5'>{html_escape(row['delete_error'] or '')}</small></td><td>{actions}</td></tr>"""
+            )
+        body = (
+            "<div class=card><h2>待清理监控通知</h2>"
+            "<p class=muted>这里列出已经发到 Telegram、但尚未从队列移除的监控消息。"
+            f"当前模式：<b>{'已读后再删' if cleanup['message_delete_mode'] == 'after_read' else '按发送时间删除'}</b>。"
+            "</p>"
+            "<div class=actions><a class='btn' href='/monitor/events'>返回推送历史</a> "
+            "<a class='btn primary' href='/monitor/messages/read-all'>全部标记已读</a></div>"
+            "<table><tr><th>Chat / Msg</th><th>监控</th><th>状态</th><th>错误</th><th>操作</th></tr>"
+            + "".join(trs)
+            + "</table></div>"
+        )
+        return layout("待清理通知", body)
+
+    @app.get("/monitor/messages/read-all")
+    async def monitor_messages_read_all(_: str = Depends(panel_auth)) -> RedirectResponse:
+        mark_all_monitor_messages_read()
+        return RedirectResponse("/monitor/messages", status_code=303)
+
+    @app.get("/monitor/messages/{chat_id}/{message_id}/read")
+    async def monitor_message_read(chat_id: int, message_id: int, _: str = Depends(panel_auth)) -> RedirectResponse:
+        mark_monitor_message_read(chat_id, message_id)
+        return RedirectResponse("/monitor/messages", status_code=303)
 
     @app.get("/config/export", response_class=HTMLResponse)
     async def config_export(_: str = Depends(panel_auth)) -> str:
