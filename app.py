@@ -1841,6 +1841,21 @@ async def cmd_spamdel(message: Message, command: CommandObject) -> None:
     await message.reply(f"已删除广告关键词：{html_escape(word)}\n当前共 {len(words)} 个。")
 
 
+@router.message(Command("monread"))
+async def cmd_monread(message: Message) -> None:
+    if not is_admin_chat(message):
+        return
+    read_at = getattr(message, "date", None)
+    read_at_iso = read_at.astimezone().isoformat(timespec="seconds") if hasattr(read_at, "astimezone") else now_iso()
+    count = mark_monitor_messages_read_for_chat(
+        int(message.chat.id),
+        read_at=read_at_iso,
+        sent_before=read_at_iso,
+    )
+    minutes = int(monitor_cleanup_settings()["message_delete_after_minutes"])
+    await message.reply(f"已将当前聊天中此前的 {count} 条监控通知标记为已读，{minutes} 分钟后清理。")
+
+
 @router.message(is_admin_action_message)
 async def admin_reply_by_message(message: Message) -> None:
     # Pending /sendpic flow: after /sendpic <uid>, the next admin photo is copied to target.
@@ -1909,6 +1924,7 @@ async def admin_plain_message(message: Message) -> None:
             "管理员普通消息不会自动转发。请使用：\n"
             "/send <user_id> <内容>\n"
             "/reply <user_id> <内容>\n"
+            "/monread 标记当前聊天中此前的监控通知已读\n"
             "或直接回复某条用户消息（支持文字/图片/文件等）。若已启用 Forum 模式，也可以在用户 Topic 内直接发消息；也可以打开面板的「主动发消息」。"
         )
 
@@ -2258,6 +2274,54 @@ def mark_all_monitor_messages_read(read_at: str | None = None) -> int:
         cur = conn.execute(
             "UPDATE monitor_messages SET read_at=?, delete_error=NULL WHERE read_at IS NULL",
             (read_at or now_iso(),),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+def mark_monitor_messages_read_for_chat(
+    chat_id: int,
+    read_at: str | None = None,
+    sent_before: str | None = None,
+) -> int:
+    read_value = read_at or now_iso()
+    if not sent_before:
+        with closing(db()) as conn:
+            cur = conn.execute(
+                """
+                UPDATE monitor_messages
+                SET read_at=?, delete_error=NULL
+                WHERE chat_id=? AND read_at IS NULL
+                """,
+                (read_value, chat_id),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
+    cutoff_ts = datetime.fromisoformat(sent_before).timestamp()
+    with closing(db()) as conn:
+        rows = conn.execute(
+            """
+            SELECT message_id, sent_at
+            FROM monitor_messages
+            WHERE chat_id=? AND read_at IS NULL
+            """,
+            (chat_id,),
+        ).fetchall()
+        target_ids = [
+            int(row["message_id"])
+            for row in rows
+            if datetime.fromisoformat(str(row["sent_at"])).timestamp() <= cutoff_ts
+        ]
+        if not target_ids:
+            return 0
+        placeholders = ",".join("?" for _ in target_ids)
+        cur = conn.execute(
+            f"""
+            UPDATE monitor_messages
+            SET read_at=?, delete_error=NULL
+            WHERE chat_id=? AND message_id IN ({placeholders})
+            """,
+            (read_value, chat_id, *target_ids),
         )
         conn.commit()
         return int(cur.rowcount or 0)

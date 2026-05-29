@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -369,6 +370,75 @@ class MonitorMessageCleanupTest(unittest.TestCase):
             self.assertEqual([(1001, 2002)], fake_bot.deleted)
         finally:
             app.config = old_config
+
+    def test_mark_monitor_messages_read_for_chat_marks_only_current_chat_before_cutoff(self) -> None:
+        app.record_monitor_message(1001, 2001, "NodeSeek 新帖", delete_after_seconds=60, sent_at_ts=1000)
+        app.record_monitor_message(1001, 2002, "NodeSeek 新帖", delete_after_seconds=60, sent_at_ts=1100)
+        app.record_monitor_message(1002, 3001, "NodeSeek 新帖", delete_after_seconds=60, sent_at_ts=1000)
+        count = app.mark_monitor_messages_read_for_chat(
+            1001,
+            read_at="1970-01-01T00:30:00+00:00",
+            sent_before="1970-01-01T00:17:30+00:00",
+        )
+        self.assertEqual(1, count)
+        with closing(sqlite3.connect(app.DB_PATH)) as conn:
+            rows = conn.execute(
+                "SELECT chat_id, message_id, read_at FROM monitor_messages ORDER BY chat_id, message_id"
+            ).fetchall()
+        self.assertEqual(
+            [
+                (1001, 2001, "1970-01-01T00:30:00+00:00"),
+                (1001, 2002, None),
+                (1002, 3001, None),
+            ],
+            rows,
+        )
+
+    def test_monread_command_marks_previous_monitor_messages_in_current_chat(self) -> None:
+        old_config = app.config
+        old_admin_chat_ids = app.admin_chat_ids
+        old_bot = app.bot
+        app.config = {"cleanup": {"monitor_message_delete_after_minutes": 60}}
+        app.admin_chat_ids = [1001]
+        app.bot = object()
+        app.record_monitor_message(1001, 2001, "NodeSeek 新帖", delete_after_seconds=60, sent_at_ts=1000)
+        app.record_monitor_message(1001, 2002, "NodeSeek 新帖", delete_after_seconds=60, sent_at_ts=1100)
+        app.record_monitor_message(1002, 3001, "NodeSeek 新帖", delete_after_seconds=60, sent_at_ts=1000)
+
+        class FakeAdminCommandMessage:
+            def __init__(self) -> None:
+                self.chat = SimpleNamespace(id=1001)
+                self.text = "/monread"
+                self.date = datetime.fromtimestamp(1050, timezone.utc)
+                self.replies: list[str] = []
+
+            async def reply(self, text: str):
+                self.replies.append(text)
+
+        message = FakeAdminCommandMessage()
+        try:
+            asyncio.run(app.cmd_monread(message))
+            expected_read_at = datetime.fromtimestamp(1050, timezone.utc).astimezone().isoformat(timespec="seconds")
+            self.assertEqual(
+                ["已将当前聊天中此前的 1 条监控通知标记为已读，60 分钟后清理。"],
+                message.replies,
+            )
+            with closing(sqlite3.connect(app.DB_PATH)) as conn:
+                rows = conn.execute(
+                    "SELECT chat_id, message_id, read_at FROM monitor_messages ORDER BY chat_id, message_id"
+                ).fetchall()
+            self.assertEqual(
+                [
+                    (1001, 2001, expected_read_at),
+                    (1001, 2002, None),
+                    (1002, 3001, None),
+                ],
+                rows,
+            )
+        finally:
+            app.config = old_config
+            app.admin_chat_ids = old_admin_chat_ids
+            app.bot = old_bot
 
     def test_copy_message_to_user_records_media_log(self) -> None:
         old_bot = app.bot
