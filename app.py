@@ -342,6 +342,14 @@ def bot_token_env_name(role: str) -> str:
     }.get(role, "TELEGRAM_BOT_TOKEN")
 
 
+def monitor_read_command() -> str:
+    load_dotenv(ENV_PATH, override=True)
+    raw = os.getenv("MONITOR_READ_COMMAND", "/r").strip()
+    if not raw:
+        return "/r"
+    return raw if raw.startswith("/") else f"/{raw}"
+
+
 def role_bot_token(role: str) -> str:
     load_dotenv(ENV_PATH, override=True)
     specific = os.getenv(bot_token_env_name(role), "").strip()
@@ -400,6 +408,21 @@ def role_token_matches_message(message: Message, role: str) -> bool:
     if message_token:
         return message_token == role_bot_token(role)
     return current is not None
+
+
+def command_token(text: str | None) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    return value.split(maxsplit=1)[0]
+
+
+def command_matches(text: str | None, command: str) -> bool:
+    token = command_token(text)
+    if not token:
+        return False
+    token_base = token.split("@", 1)[0]
+    return token_base == command
 
 
 def admin_route_mode() -> str:
@@ -1661,6 +1684,15 @@ def is_admin_action_message(message: Message) -> bool:
     return bool(message.reply_to_message)
 
 
+def is_monitor_read_command_message(message: Message) -> bool:
+    if not is_admin_chat(message):
+        return False
+    text = getattr(message, "text", None)
+    if command_matches(text, monitor_read_command()):
+        return True
+    return command_matches(text, "/monread")
+
+
 @router.message(Command("start"))
 async def start(message: Message) -> None:
     if not role_token_matches_message(message, BOT_ROLE_RELAY):
@@ -1841,10 +1873,8 @@ async def cmd_spamdel(message: Message, command: CommandObject) -> None:
     await message.reply(f"已删除广告关键词：{html_escape(word)}\n当前共 {len(words)} 个。")
 
 
-@router.message(Command("monread"))
+@router.message(is_monitor_read_command_message)
 async def cmd_monread(message: Message) -> None:
-    if not is_admin_chat(message):
-        return
     read_at = getattr(message, "date", None)
     read_at_iso = read_at.astimezone().isoformat(timespec="seconds") if hasattr(read_at, "astimezone") else now_iso()
     count = mark_monitor_messages_read_for_chat(
@@ -1853,7 +1883,26 @@ async def cmd_monread(message: Message) -> None:
         sent_before=read_at_iso,
     )
     minutes = int(monitor_cleanup_settings()["message_delete_after_minutes"])
-    await message.reply(f"已将当前聊天中此前的 {count} 条监控通知标记为已读，{minutes} 分钟后清理。")
+    reply = await message.reply(f"已将此前 {count} 条监控通知标记为已读，{minutes} 分钟后清理。")
+    delete_after_seconds = minutes * 60
+    command_message_id = int(getattr(message, "message_id", 0) or 0)
+    if command_message_id:
+        record_monitor_message(
+            int(message.chat.id),
+            command_message_id,
+            "[系统] 监控已读命令",
+            delete_after_seconds,
+            read_at=read_at_iso,
+        )
+    reply_message_id = int(getattr(reply, "message_id", 0) or 0)
+    if reply_message_id:
+        record_monitor_message(
+            int(message.chat.id),
+            reply_message_id,
+            "[系统] 监控已读确认",
+            delete_after_seconds,
+            read_at=read_at_iso,
+        )
 
 
 @router.message(is_admin_action_message)
@@ -1924,7 +1973,7 @@ async def admin_plain_message(message: Message) -> None:
             "管理员普通消息不会自动转发。请使用：\n"
             "/send <user_id> <内容>\n"
             "/reply <user_id> <内容>\n"
-            "/monread 标记当前聊天中此前的监控通知已读\n"
+            f"{monitor_read_command()} 标记当前聊天中此前的监控通知已读\n"
             "或直接回复某条用户消息（支持文字/图片/文件等）。若已启用 Forum 模式，也可以在用户 Topic 内直接发消息；也可以打开面板的「主动发消息」。"
         )
 
@@ -2223,6 +2272,7 @@ def record_monitor_message(
     monitor_name: str,
     delete_after_seconds: int,
     sent_at_ts: float | None = None,
+    read_at: str | None = None,
 ) -> None:
     sent_ts = time.time() if sent_at_ts is None else sent_at_ts
     sent_at = datetime.fromtimestamp(sent_ts, timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -2239,7 +2289,7 @@ def record_monitor_message(
                 monitor_name,
                 sent_at,
                 max(1, int(delete_after_seconds)),
-                None,
+                read_at,
             ),
         )
         conn.commit()
@@ -2633,6 +2683,7 @@ def env_values() -> dict[str, str]:
         "RELAY_BOT_TOKEN": os.getenv("RELAY_BOT_TOKEN", ""),
         "MONITOR_BOT_TOKEN": os.getenv("MONITOR_BOT_TOKEN", ""),
         "GROUP_BOT_TOKEN": os.getenv("GROUP_BOT_TOKEN", ""),
+        "MONITOR_READ_COMMAND": os.getenv("MONITOR_READ_COMMAND", "/r"),
         "ADMIN_CHAT_ID": os.getenv("ADMIN_CHAT_ID", ""),
         "ADMIN_ROUTE_MODE": os.getenv("ADMIN_ROUTE_MODE", "direct"),
         "ADMIN_FORUM_GROUP_ID": os.getenv("ADMIN_FORUM_GROUP_ID", ""),
@@ -2663,6 +2714,7 @@ def write_env_values(values: dict[str, str]) -> None:
         f"RELAY_BOT_TOKEN={values.get('RELAY_BOT_TOKEN','')}",
         f"MONITOR_BOT_TOKEN={values.get('MONITOR_BOT_TOKEN','')}",
         f"GROUP_BOT_TOKEN={values.get('GROUP_BOT_TOKEN','')}",
+        f"MONITOR_READ_COMMAND={values.get('MONITOR_READ_COMMAND','/r')}",
         f"ADMIN_CHAT_ID={values.get('ADMIN_CHAT_ID','')}",
         f"ADMIN_ROUTE_MODE={values.get('ADMIN_ROUTE_MODE','direct')}",
         f"ADMIN_FORUM_GROUP_ID={values.get('ADMIN_FORUM_GROUP_ID','')}",
@@ -3517,6 +3569,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
 <label>共享 Telegram Bot Token</label><input name=TELEGRAM_BOT_TOKEN value='{html_escape(v['TELEGRAM_BOT_TOKEN'])}' placeholder='留空则仅使用下面的角色专用 Token；填写后可作为三类角色的默认回退 Token'>
 <h3>角色 Bot Token（可选覆盖）</h3><p class=muted>留空则继承上面的共享 Token。Relay=双向机器人，Monitor=监控推送，Group=群监听。</p>
 <div class=grid><div><label>RELAY_BOT_TOKEN</label><input name=RELAY_BOT_TOKEN value='{html_escape(v['RELAY_BOT_TOKEN'])}' placeholder='双向机器人专用'></div><div><label>MONITOR_BOT_TOKEN</label><input name=MONITOR_BOT_TOKEN value='{html_escape(v['MONITOR_BOT_TOKEN'])}' placeholder='监控推送专用'></div><div><label>GROUP_BOT_TOKEN</label><input name=GROUP_BOT_TOKEN value='{html_escape(v['GROUP_BOT_TOKEN'])}' placeholder='群监听专用'></div></div>
+<div class=grid><div><label>监控已读快捷命令</label><input name=MONITOR_READ_COMMAND value='{html_escape(v['MONITOR_READ_COMMAND'])}' placeholder='/r'></div><div><label>命令说明</label><small class=muted>在管理员聊天发送该命令，会将此前监控通知标记为已读，并在删除时间到达后连同命令和确认回复一起删除。</small></div></div>
 <div class=grid><div><label>管理员路由模式</label><select name=ADMIN_ROUTE_MODE><option value='direct' {'selected' if v['ADMIN_ROUTE_MODE'] == 'direct' else ''}>direct 直发管理员</option><option value='forum_topic' {'selected' if v['ADMIN_ROUTE_MODE'] == 'forum_topic' else ''}>forum_topic 私有超级群 Topic</option></select></div><div><label>管理员 ADMIN_CHAT_ID</label><input name=ADMIN_CHAT_ID value='{html_escape(v['ADMIN_CHAT_ID'])}' placeholder='直发模式可填最多 3 个，逗号分隔'></div></div>
 <label>ADMIN_FORUM_GROUP_ID（私有超级群 ID）</label><input name=ADMIN_FORUM_GROUP_ID value='{html_escape(v['ADMIN_FORUM_GROUP_ID'])}' placeholder='forum_topic 模式必填，例如 -1001234567890'>
 <h3>TG 用户会话（可选）</h3><p class=muted>仅用于“TG 群监听 -> 监听来源=用户会话”，适合 Bot 无法加入的群。填写后需重启。</p>
@@ -3547,7 +3600,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         cfg_save(cfg)
 
     @app.post("/settings", response_class=HTMLResponse)
-    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), RELAY_BOT_TOKEN: str = Form(""), MONITOR_BOT_TOKEN: str = Form(""), GROUP_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), ADMIN_ROUTE_MODE: str = Form("direct"), ADMIN_FORUM_GROUP_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440), CLEANUP_MESSAGE_DELETE_MODE: str = Form("ttl")) -> str:
+    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), RELAY_BOT_TOKEN: str = Form(""), MONITOR_BOT_TOKEN: str = Form(""), GROUP_BOT_TOKEN: str = Form(""), MONITOR_READ_COMMAND: str = Form("/r"), ADMIN_CHAT_ID: str = Form(""), ADMIN_ROUTE_MODE: str = Form("direct"), ADMIN_FORUM_GROUP_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440), CLEANUP_MESSAGE_DELETE_MODE: str = Form("ttl")) -> str:
         save_panel_settings(locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED}, CLEANUP_INTERVAL_MINUTES, CLEANUP_MESSAGE_DELETE_AFTER_MINUTES, CLEANUP_RETENTION_MINUTES, CLEANUP_MESSAGE_DELETE_MODE)
         return layout("已保存", "<div class=msg>已保存，不会自动重启；修改 Token/管理员 ID 后请重启。</div><p><a class=btn href='/settings'>返回</a> <a class=btn href='/restart'>重启机器人</a></p>")
 
@@ -3674,6 +3727,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         settings_card = f"""<div class=card><h2>Bot / 面板配置</h2><p class=muted>这里和“Bot / 面板设置”共用同一份 .env。可为双向机器人、监控推送、群监听分别填写不同 Token；留空则继承共享 Token。修改后不会自动重启，需要手动重启服务。</p><form method=post action='/users/settings'>
 <label>共享 Telegram Bot Token</label><input name=TELEGRAM_BOT_TOKEN value='{html_escape(v['TELEGRAM_BOT_TOKEN'])}' placeholder='123456:ABC...'>
 <div class=grid><div><label>RELAY_BOT_TOKEN</label><input name=RELAY_BOT_TOKEN value='{html_escape(v['RELAY_BOT_TOKEN'])}'></div><div><label>MONITOR_BOT_TOKEN</label><input name=MONITOR_BOT_TOKEN value='{html_escape(v['MONITOR_BOT_TOKEN'])}'></div><div><label>GROUP_BOT_TOKEN</label><input name=GROUP_BOT_TOKEN value='{html_escape(v['GROUP_BOT_TOKEN'])}'></div></div>
+<div class=grid><div><label>监控已读快捷命令</label><input name=MONITOR_READ_COMMAND value='{html_escape(v['MONITOR_READ_COMMAND'])}' placeholder='/r'></div><div><label>说明</label><small class=muted>发送该命令会把此前监控通知标记为已读，并把命令及确认回复一起加入删除队列。</small></div></div>
 <div class=grid><div><label>管理员路由模式</label><select name=ADMIN_ROUTE_MODE><option value='direct' {'selected' if v['ADMIN_ROUTE_MODE'] == 'direct' else ''}>direct 直发管理员</option><option value='forum_topic' {'selected' if v['ADMIN_ROUTE_MODE'] == 'forum_topic' else ''}>forum_topic 私有超级群 Topic</option></select></div><div><label>管理员 ADMIN_CHAT_ID</label><input name=ADMIN_CHAT_ID value='{html_escape(v['ADMIN_CHAT_ID'])}'></div></div>
 <label>ADMIN_FORUM_GROUP_ID（私有超级群 ID）</label><input name=ADMIN_FORUM_GROUP_ID value='{html_escape(v['ADMIN_FORUM_GROUP_ID'])}'>
 <h3>TG 用户会话（可选）</h3><p class=muted>仅用于 TG 群监听来源=用户会话。修改后需重启。</p>
@@ -3685,7 +3739,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         return layout("用户管理", body)
 
     @app.post("/users/settings", response_class=HTMLResponse)
-    async def users_settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), RELAY_BOT_TOKEN: str = Form(""), MONITOR_BOT_TOKEN: str = Form(""), GROUP_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), ADMIN_ROUTE_MODE: str = Form("direct"), ADMIN_FORUM_GROUP_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin")) -> str:
+    async def users_settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), RELAY_BOT_TOKEN: str = Form(""), MONITOR_BOT_TOKEN: str = Form(""), GROUP_BOT_TOKEN: str = Form(""), MONITOR_READ_COMMAND: str = Form("/r"), ADMIN_CHAT_ID: str = Form(""), ADMIN_ROUTE_MODE: str = Form("direct"), ADMIN_FORUM_GROUP_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin")) -> str:
         cleanup = (cfg_load_fresh().get("cleanup") or {})
         save_panel_settings(
             locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED},

@@ -408,19 +408,21 @@ class MonitorMessageCleanupTest(unittest.TestCase):
         class FakeAdminCommandMessage:
             def __init__(self) -> None:
                 self.chat = SimpleNamespace(id=1001)
-                self.text = "/monread"
+                self.message_id = 9001
+                self.text = "/r"
                 self.date = datetime.fromtimestamp(1050, timezone.utc)
                 self.replies: list[str] = []
 
             async def reply(self, text: str):
                 self.replies.append(text)
+                return SimpleNamespace(message_id=9002)
 
         message = FakeAdminCommandMessage()
         try:
             asyncio.run(app.cmd_monread(message))
             expected_read_at = datetime.fromtimestamp(1050, timezone.utc).astimezone().isoformat(timespec="seconds")
             self.assertEqual(
-                ["已将当前聊天中此前的 1 条监控通知标记为已读，60 分钟后清理。"],
+                ["已将此前 1 条监控通知标记为已读，60 分钟后清理。"],
                 message.replies,
             )
             with closing(sqlite3.connect(app.DB_PATH)) as conn:
@@ -431,6 +433,8 @@ class MonitorMessageCleanupTest(unittest.TestCase):
                 [
                     (1001, 2001, expected_read_at),
                     (1001, 2002, None),
+                    (1001, 9001, expected_read_at),
+                    (1001, 9002, expected_read_at),
                     (1002, 3001, None),
                 ],
                 rows,
