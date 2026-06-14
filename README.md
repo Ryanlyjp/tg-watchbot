@@ -5,6 +5,7 @@
   <p>
     <a href="#ai-one-line-install">AI 一句话安装</a> ·
     <a href="#docker-install">Docker 安装</a> ·
+    <a href="#forwarder-dual-engine">Forwarder 双引擎</a> ·
     <a href="#manual-install">手动安装</a> ·
     <a href="#systemd-install">systemd 部署</a> ·
     <a href="#面板路由">面板路由</a> ·
@@ -19,6 +20,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 管理员可以直接回复、主动发文字/图片、并通过“回复用户消息”回传文字、图片、文件、视频等常见媒体；
 - 后台定时监控 RSS 或网页，命中关键词、新条目、价格/库存变化后推送给管理员；
 - 支持把双向机器人、监控推送、群监听拆成 3 个独立 Bot，也支持共用同一个 Bot Token；
+- 支持把 [TelegramForwarder](https://github.com/Heavrnl/TelegramForwarder) 作为可选子服务接入，保留其完整转发能力；
 - 自带一个 Web 管理面板，可配置监控目标、编辑 YAML、查看收件箱和日志。
 
 项目为单文件应用，适合个人服务器、NAT 小鸡、轻量 VPS 直接用 systemd 跑。
@@ -189,6 +191,100 @@ docker compose logs -f
 ```bash
 docker compose restart
 ```
+
+<a id="forwarder-dual-engine"></a>
+## TelegramForwarder 子服务双引擎
+
+如果你想把“群监控”升级为完整“群/频道转发”，并保留 `TelegramForwarder` 的原生能力（Telethon 用户会话监听、关键词/正则过滤、替换、AI、RSS、Apprise 推送等），可以启用项目内置的可选子服务。
+
+### 目录结构
+
+`tg-watchbot` 现已预留：
+
+```text
+forwarder/.env.example
+forwarder/db
+forwarder/logs
+forwarder/sessions
+forwarder/temp
+forwarder/config
+forwarder/rss/data
+forwarder/rss/media
+forwarder/ufb/config
+```
+
+其中真正运行时使用的是 `forwarder/.env`。你可以：
+
+- 在 Web 面板打开 `/forwarder`，点击“从示例初始化”，然后像 watchbot 原生设置页一样按分区表单填写必填项、基础配置、AI、RSS 和扩展配置；
+- 如果需要完全贴近上游原始配置，也可以继续在同一页面使用“完整 `.env` 编辑器”高级模式；
+- 或手动执行：
+
+```bash
+cd tg-watchbot
+cp forwarder/.env.example forwarder/.env
+```
+
+至少填写这些必填项：
+
+```text
+API_ID=
+API_HASH=
+PHONE_NUMBER=
+BOT_TOKEN=
+USER_ID=
+```
+
+### 首次登录与启动
+
+`docker-compose.yml` 已内置 `telegram-forwarder` 服务，但它放在 `forwarder` profile 下，默认不会随主服务自动启动。
+
+首次运行建议前台执行一次，完成验证码 / 2FA：
+
+```bash
+docker compose --profile forwarder run --rm telegram-forwarder
+```
+
+完成登录后，后台常驻：
+
+```bash
+docker compose --profile forwarder up -d tg-watchbot telegram-forwarder
+```
+
+查看日志：
+
+```bash
+docker compose logs -f telegram-forwarder
+```
+
+重启子服务：
+
+```bash
+docker compose --profile forwarder restart telegram-forwarder
+```
+
+### RSS 面板
+
+子服务默认映射宿主机端口：
+
+```text
+http://127.0.0.1:9804
+```
+
+是否真正提供 RSS 页面取决于 `forwarder/.env` 里的：
+
+```text
+RSS_ENABLED=true
+```
+
+### 面板入口
+
+`tg-watchbot` 面板现已新增 `/forwarder` 页面，可用于：
+
+- 初始化 `forwarder/.env`
+- 直接编辑 TelegramForwarder 的完整环境变量
+- 查看必填项是否完整
+- 查看运行目录和 compose 启动命令
+- 在启用 RSS 后快速跳转到 RSS 面板
 
 <a id="manual-install"></a>
 ## 手动安装（Python）
@@ -506,6 +602,7 @@ monitors:
 | `/run-once` | 手动检查全部监控 |
 | `/yaml` | YAML 高级编辑 |
 | `/settings` | `.env` 设置和监控清理策略 |
+| `/forwarder` | TelegramForwarder 子服务配置、状态与启动命令 |
 | `/send` | 主动发消息给已私聊过 Bot 的用户 |
 | `/inbox` | 收件箱 |
 | `/users` | 用户管理 |

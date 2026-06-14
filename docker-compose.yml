@@ -13,3 +13,30 @@ services:
       - ./config.yaml:/app/config.yaml
       - ./tg-watchbot.sqlite3:/app/tg-watchbot.sqlite3
       - ./tg-watchbot.log:/app/tg-watchbot.log
+  telegram-forwarder:
+    image: heavrnl/telegramforwarder:latest
+    container_name: telegram-forwarder
+    profiles:
+      - forwarder
+    restart: unless-stopped
+    env_file:
+      - path: ./forwarder/.env
+        required: false
+    ports:
+      - "9804:8000"
+    volumes:
+      - ./forwarder/db:/app/db
+      - ./forwarder/logs:/app/logs
+      - ./forwarder/sessions:/app/sessions
+      - ./forwarder/temp:/app/temp
+      - ./forwarder/ufb/config:/app/ufb/config
+      - ./forwarder/config:/app/config
+      - ./forwarder/rss/data:/app/rss/data
+      - ./forwarder/rss/media:/app/rss/media
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    stdin_open: true
+    tty: true

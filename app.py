@@ -58,6 +58,107 @@ DB_PATH = BASE_DIR / "tg-watchbot.sqlite3"
 CONFIG_PATH = BASE_DIR / "config.yaml"
 ENV_PATH = BASE_DIR / ".env"
 LOG_PATH = BASE_DIR / "tg-watchbot.log"
+FORWARDER_DIR = BASE_DIR / "forwarder"
+FORWARDER_ENV_PATH = FORWARDER_DIR / ".env"
+FORWARDER_ENV_EXAMPLE_PATH = FORWARDER_DIR / ".env.example"
+FORWARDER_RSS_HOST_PORT = 9804
+FORWARDER_REQUIRED_ENV_KEYS = ("API_ID", "API_HASH", "PHONE_NUMBER", "BOT_TOKEN", "USER_ID")
+FORWARDER_RUNTIME_DIRS = (
+    FORWARDER_DIR / "db",
+    FORWARDER_DIR / "logs",
+    FORWARDER_DIR / "sessions",
+    FORWARDER_DIR / "temp",
+    FORWARDER_DIR / "ufb" / "config",
+    FORWARDER_DIR / "config",
+    FORWARDER_DIR / "rss" / "data",
+    FORWARDER_DIR / "rss" / "media",
+)
+FORWARDER_ENV_SECTIONS: list[dict[str, Any]] = [
+    {
+        "title": "必填项",
+        "description": "首次启动 TelegramForwarder 至少需要这些字段，缺少任何一项都无法正常登录或监听。",
+        "fields": [
+            {"key": "API_ID", "label": "API_ID", "kind": "input", "placeholder": "从 my.telegram.org/apps 获取"},
+            {"key": "API_HASH", "label": "API_HASH", "kind": "input", "placeholder": "32 位哈希"},
+            {"key": "PHONE_NUMBER", "label": "PHONE_NUMBER", "kind": "input", "placeholder": "+8613812345678"},
+            {"key": "BOT_TOKEN", "label": "BOT_TOKEN", "kind": "input", "placeholder": "123456:ABC..."},
+            {"key": "USER_ID", "label": "USER_ID", "kind": "input", "placeholder": "从 @userinfobot 获取"},
+        ],
+    },
+    {
+        "title": "基础设置",
+        "description": "这些字段对应原项目最常用的基础运行配置。",
+        "fields": [
+            {"key": "ADMINS", "label": "ADMINS", "kind": "input", "placeholder": "多个用户 ID 用逗号分隔"},
+            {"key": "BOT_MESSAGE_DELETE_TIMEOUT", "label": "BOT_MESSAGE_DELETE_TIMEOUT", "kind": "input", "placeholder": "300"},
+            {"key": "USER_MESSAGE_DELETE_ENABLE", "label": "USER_MESSAGE_DELETE_ENABLE", "kind": "checkbox"},
+            {"key": "DEFAULT_MAX_MEDIA_SIZE", "label": "DEFAULT_MAX_MEDIA_SIZE", "kind": "input", "placeholder": "15"},
+            {"key": "DEFAULT_TIMEZONE", "label": "DEFAULT_TIMEZONE", "kind": "input", "placeholder": "Asia/Shanghai"},
+            {"key": "CHAT_UPDATE_TIME", "label": "CHAT_UPDATE_TIME", "kind": "input", "placeholder": "03:00"},
+            {"key": "DATABASE_URL", "label": "DATABASE_URL", "kind": "input", "placeholder": "sqlite:///./db/forward.db"},
+        ],
+    },
+    {
+        "title": "界面布局",
+        "description": "这些是 TelegramForwarder 原项目界面的分页与矩阵尺寸设置，通常保持默认即可。",
+        "fields": [
+            {"key": "AI_MODELS_PER_PAGE", "label": "AI_MODELS_PER_PAGE", "kind": "input", "placeholder": "10"},
+            {"key": "KEYWORDS_PER_PAGE", "label": "KEYWORDS_PER_PAGE", "kind": "input", "placeholder": "10"},
+            {"key": "PUSH_CHANNEL_PER_PAGE", "label": "PUSH_CHANNEL_PER_PAGE", "kind": "input", "placeholder": "10"},
+            {"key": "SUMMARY_TIME_ROWS", "label": "SUMMARY_TIME_ROWS", "kind": "input", "placeholder": "10"},
+            {"key": "SUMMARY_TIME_COLS", "label": "SUMMARY_TIME_COLS", "kind": "input", "placeholder": "6"},
+            {"key": "DELAY_TIME_ROWS", "label": "DELAY_TIME_ROWS", "kind": "input", "placeholder": "10"},
+            {"key": "DELAY_TIME_COLS", "label": "DELAY_TIME_COLS", "kind": "input", "placeholder": "6"},
+            {"key": "MEDIA_SIZE_ROWS", "label": "MEDIA_SIZE_ROWS", "kind": "input", "placeholder": "10"},
+            {"key": "MEDIA_SIZE_COLS", "label": "MEDIA_SIZE_COLS", "kind": "input", "placeholder": "6"},
+            {"key": "MEDIA_EXTENSIONS_ROWS", "label": "MEDIA_EXTENSIONS_ROWS", "kind": "input", "placeholder": "10"},
+            {"key": "MEDIA_EXTENSIONS_COLS", "label": "MEDIA_EXTENSIONS_COLS", "kind": "input", "placeholder": "6"},
+            {"key": "RULES_PER_PAGE", "label": "RULES_PER_PAGE", "kind": "input", "placeholder": "20"},
+        ],
+    },
+    {
+        "title": "AI 设置",
+        "description": "保留 Forwarder 的完整 AI 配置，包括多厂商 API Key、Base URL、默认模型与提示词。",
+        "fields": [
+            {"key": "DEFAULT_AI_MODEL", "label": "DEFAULT_AI_MODEL", "kind": "input", "placeholder": "gemini-2.0-flash"},
+            {"key": "OPENAI_API_KEY", "label": "OPENAI_API_KEY", "kind": "input", "placeholder": "sk-..."},
+            {"key": "OPENAI_API_BASE", "label": "OPENAI_API_BASE", "kind": "input", "placeholder": "留空使用官方接口"},
+            {"key": "CLAUDE_API_KEY", "label": "CLAUDE_API_KEY", "kind": "input"},
+            {"key": "CLAUDE_API_BASE", "label": "CLAUDE_API_BASE", "kind": "input"},
+            {"key": "GEMINI_API_KEY", "label": "GEMINI_API_KEY", "kind": "input"},
+            {"key": "GEMINI_API_BASE", "label": "GEMINI_API_BASE", "kind": "input"},
+            {"key": "DEEPSEEK_API_KEY", "label": "DEEPSEEK_API_KEY", "kind": "input"},
+            {"key": "DEEPSEEK_API_BASE", "label": "DEEPSEEK_API_BASE", "kind": "input"},
+            {"key": "QWEN_API_KEY", "label": "QWEN_API_KEY", "kind": "input"},
+            {"key": "QWEN_API_BASE", "label": "QWEN_API_BASE", "kind": "input"},
+            {"key": "GROK_API_KEY", "label": "GROK_API_KEY", "kind": "input"},
+            {"key": "GROK_API_BASE", "label": "GROK_API_BASE", "kind": "input"},
+            {"key": "DEFAULT_AI_PROMPT", "label": "DEFAULT_AI_PROMPT", "kind": "textarea", "rows": 5, "placeholder": "默认 AI 重写提示词"},
+            {"key": "DEFAULT_SUMMARY_PROMPT", "label": "DEFAULT_SUMMARY_PROMPT", "kind": "textarea", "rows": 4, "placeholder": "默认 AI 总结提示词"},
+            {"key": "DEFAULT_SUMMARY_TIME", "label": "DEFAULT_SUMMARY_TIME", "kind": "input", "placeholder": "07:00"},
+            {"key": "SUMMARY_BATCH_SIZE", "label": "SUMMARY_BATCH_SIZE", "kind": "input", "placeholder": "20"},
+            {"key": "SUMMARY_BATCH_DELAY", "label": "SUMMARY_BATCH_DELAY", "kind": "input", "placeholder": "2"},
+        ],
+    },
+    {
+        "title": "RSS 设置",
+        "description": "如果启用 Forwarder 自带的 RSS 服务，可在这里管理开关与基础 URL。",
+        "fields": [
+            {"key": "RSS_ENABLED", "label": "RSS_ENABLED", "kind": "checkbox"},
+            {"key": "RSS_BASE_URL", "label": "RSS_BASE_URL", "kind": "input", "placeholder": "例如 https://rss.example.com"},
+            {"key": "RSS_MEDIA_BASE_URL", "label": "RSS_MEDIA_BASE_URL", "kind": "input", "placeholder": "媒体文件基础 URL"},
+        ],
+    },
+    {
+        "title": "扩展功能",
+        "description": "对应原项目的 UFB 同步服务配置。",
+        "fields": [
+            {"key": "UFB_ENABLED", "label": "UFB_ENABLED", "kind": "checkbox"},
+            {"key": "UFB_SERVER_URL", "label": "UFB_SERVER_URL", "kind": "input"},
+            {"key": "UFB_TOKEN", "label": "UFB_TOKEN", "kind": "input"},
+        ],
+    },
+]
 MIN_INTERVAL_SECONDS = 60
 DEFAULT_MONITOR_MESSAGE_DELETE_AFTER_MINUTES = 60
 DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS = 30
@@ -2700,6 +2801,43 @@ def env_values() -> dict[str, str]:
     }
 
 
+def parse_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+    return values
+
+
+def forwarder_env_defaults() -> dict[str, str]:
+    defaults: dict[str, str] = {}
+    for section in FORWARDER_ENV_SECTIONS:
+        for field in section.get("fields") or []:
+            key = str(field.get("key") or "").strip()
+            if not key:
+                continue
+            if field.get("kind") == "checkbox":
+                defaults[key] = "false"
+            else:
+                defaults[key] = ""
+    return defaults
+
+
+def forwarder_env_values() -> dict[str, str]:
+    values = forwarder_env_defaults()
+    values.update(parse_env_file(FORWARDER_ENV_PATH))
+    return values
+
+
+def env_bool(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def write_env_values(values: dict[str, str]) -> None:
     existing = {}
     if ENV_PATH.exists():
@@ -2735,6 +2873,78 @@ def write_env_values(values: dict[str, str]) -> None:
     ENV_PATH.write_text("\n".join(lines), encoding="utf-8")
     ENV_PATH.chmod(0o600)
     load_dotenv(ENV_PATH, override=True)
+
+
+def ensure_forwarder_workspace(copy_example_env: bool = False) -> bool:
+    FORWARDER_DIR.mkdir(parents=True, exist_ok=True)
+    for path in FORWARDER_RUNTIME_DIRS:
+        path.mkdir(parents=True, exist_ok=True)
+    if copy_example_env and not FORWARDER_ENV_PATH.exists() and FORWARDER_ENV_EXAMPLE_PATH.exists():
+        FORWARDER_ENV_PATH.write_text(FORWARDER_ENV_EXAMPLE_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+        FORWARDER_ENV_PATH.chmod(0o600)
+        return True
+    return False
+
+
+def forwarder_env_text() -> str:
+    if FORWARDER_ENV_PATH.exists():
+        return FORWARDER_ENV_PATH.read_text(encoding="utf-8", errors="replace")
+    if FORWARDER_ENV_EXAMPLE_PATH.exists():
+        return FORWARDER_ENV_EXAMPLE_PATH.read_text(encoding="utf-8", errors="replace")
+    return ""
+
+
+def write_forwarder_env_values(values: dict[str, str]) -> None:
+    ensure_forwarder_workspace(copy_example_env=False)
+    lines: list[str] = []
+    for section in FORWARDER_ENV_SECTIONS:
+        title = str(section.get("title") or "").strip()
+        description = str(section.get("description") or "").strip()
+        if title:
+            lines.append(f"######### {title} #########")
+        if description:
+            lines.append(f"# {description}")
+        for field in section.get("fields") or []:
+            key = str(field.get("key") or "").strip()
+            if not key:
+                continue
+            value = str(values.get(key, "") or "")
+            lines.append(f"{key}={value}")
+        lines.append("")
+    FORWARDER_ENV_PATH.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    FORWARDER_ENV_PATH.chmod(0o600)
+
+
+def write_forwarder_env_text(text: str) -> None:
+    ensure_forwarder_workspace(copy_example_env=False)
+    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n").rstrip() + "\n"
+    FORWARDER_ENV_PATH.write_text(normalized, encoding="utf-8")
+    FORWARDER_ENV_PATH.chmod(0o600)
+
+
+def forwarder_status() -> dict[str, Any]:
+    ensure_forwarder_workspace(copy_example_env=False)
+    values = forwarder_env_values()
+    missing = [key for key in FORWARDER_REQUIRED_ENV_KEYS if not values.get(key, "").strip()]
+    rss_enabled = str(values.get("RSS_ENABLED", "false")).strip().lower() == "true"
+    rss_url = f"http://127.0.0.1:{FORWARDER_RSS_HOST_PORT}" if rss_enabled else ""
+    runtime_dirs: list[str] = []
+    for path in FORWARDER_RUNTIME_DIRS:
+        try:
+            runtime_dirs.append(str(path.relative_to(BASE_DIR)))
+        except ValueError:
+            runtime_dirs.append(str(path))
+    return {
+        "env_exists": FORWARDER_ENV_PATH.exists(),
+        "example_exists": FORWARDER_ENV_EXAMPLE_PATH.exists(),
+        "values": values,
+        "missing_required": missing,
+        "required_ready": not missing,
+        "rss_enabled": rss_enabled,
+        "rss_url": rss_url,
+        "env_text": forwarder_env_text(),
+        "runtime_dirs": runtime_dirs,
+    }
 
 
 def cfg_load_fresh() -> dict[str, Any]:
@@ -3020,7 +3230,7 @@ pre{{white-space:pre-wrap;background:#121212;color:#fff;padding:13px;border:4px 
 @media (prefers-reduced-motion: reduce){{
   *,*::before,*::after{{animation:none!important;transition:none!important}}
 }}
-</style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><section><b>消息</b><a href='/inbox'>收件箱</a><a href='/users'>用户管理</a><a href='/send'>主动发消息</a><a href='/replies'>快捷回复</a><a href='/rules'>私聊广告拦截</a></section><section><b>监控</b><a href='/'>监控面板</a><a href='/monitor/new'>新增监控</a><a href='/group-monitors'>TG 群监听</a><a href='/monitor/events'>推送历史</a><a href='/run-once'>手动检查</a></section><section><b>配置</b><a href='/settings'>Bot / 面板设置</a><a href='/yaml'>YAML 高级编辑</a><a href='/config/export'>导出配置</a></section><section><b>系统</b><a href='/update'>更新代码</a><a href='/logs'>运行日志</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启机器人</a><a class=logout href='/logout'>退出登录</a></section></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><span class=badge>WatchBot Panel</span></div>
+</style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><section><b>消息</b><a href='/inbox'>收件箱</a><a href='/users'>用户管理</a><a href='/send'>主动发消息</a><a href='/replies'>快捷回复</a><a href='/rules'>私聊广告拦截</a></section><section><b>监控</b><a href='/'>监控面板</a><a href='/monitor/new'>新增监控</a><a href='/group-monitors'>TG 群监听</a><a href='/monitor/events'>推送历史</a><a href='/run-once'>手动检查</a></section><section><b>配置</b><a href='/settings'>Bot / 面板设置</a><a href='/forwarder'>TG 转发器</a><a href='/yaml'>YAML 高级编辑</a><a href='/config/export'>导出配置</a></section><section><b>系统</b><a href='/update'>更新代码</a><a href='/logs'>运行日志</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启机器人</a><a class=logout href='/logout'>退出登录</a></section></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><span class=badge>WatchBot Panel</span></div>
 {body}<div class=friend-links><b>友链</b><a href='https://linux.do' target='_blank' rel='noopener noreferrer'>Linux.do</a><span>·</span><a href='https://www.nodeseek.com' target='_blank' rel='noopener noreferrer'>NodeSeek</a></div></main></div></body></html>"""
 
 
@@ -3052,6 +3262,44 @@ def monitor_form_html(m: dict[str, Any] | None = None, idx: int | None = None) -
 <label><input type=checkbox name=stock_change {checked('stock_change')}> 库存变化</label>
 <label><input type=checkbox name=notify_telegram {'checked' if m.get('notify_telegram', True) else ''}> 推送 Telegram</label></div>
 <div class=form-actions><button class='btn primary' type=submit>保存</button> <a class=btn href='/'>取消</a></div></form>"""
+
+
+def forwarder_form_html(values: dict[str, str]) -> str:
+    cards: list[str] = []
+    for section in FORWARDER_ENV_SECTIONS:
+        title = html_escape(section.get("title") or "")
+        description = html_escape(section.get("description") or "")
+        field_html: list[str] = []
+        for field in section.get("fields") or []:
+            key = str(field.get("key") or "").strip()
+            if not key:
+                continue
+            label = html_escape(field.get("label") or key)
+            placeholder = html_escape(field.get("placeholder") or "")
+            kind = str(field.get("kind") or "input")
+            raw_value = str(values.get(key, "") or "")
+            if kind == "checkbox":
+                field_html.append(
+                    f"<label><input type=hidden name='{html_escape(key)}' value='false'>"
+                    f"<input type=checkbox name='{html_escape(key)}' value='true' {'checked' if env_bool(raw_value) else ''}> {label}</label>"
+                )
+                continue
+            if kind == "textarea":
+                rows = max(3, safe_int(field.get("rows", 4), 4))
+                field_html.append(
+                    f"<div><label>{label}</label><textarea name='{html_escape(key)}' rows='{rows}' placeholder='{placeholder}'>{html_escape(raw_value)}</textarea></div>"
+                )
+                continue
+            field_html.append(
+                f"<div><label>{label}</label><input name='{html_escape(key)}' value='{html_escape(raw_value)}' placeholder='{placeholder}'></div>"
+            )
+        container = "check-row" if all(str(f.get("kind") or "input") == "checkbox" for f in (section.get("fields") or [])) else "grid"
+        cards.append(
+            f"<div class=card><h2>{title}</h2><p class=muted>{description}</p><div class={container}>"
+            + "".join(field_html)
+            + "</div></div>"
+        )
+    return "".join(cards)
 
 
 def group_monitor_form_html(m: dict[str, Any] | None = None, idx: int | None = None) -> str:
@@ -3603,6 +3851,106 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
     async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), RELAY_BOT_TOKEN: str = Form(""), MONITOR_BOT_TOKEN: str = Form(""), GROUP_BOT_TOKEN: str = Form(""), MONITOR_READ_COMMAND: str = Form("/r"), ADMIN_CHAT_ID: str = Form(""), ADMIN_ROUTE_MODE: str = Form("direct"), ADMIN_FORUM_GROUP_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440), CLEANUP_MESSAGE_DELETE_MODE: str = Form("ttl")) -> str:
         save_panel_settings(locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED}, CLEANUP_INTERVAL_MINUTES, CLEANUP_MESSAGE_DELETE_AFTER_MINUTES, CLEANUP_RETENTION_MINUTES, CLEANUP_MESSAGE_DELETE_MODE)
         return layout("已保存", "<div class=msg>已保存，不会自动重启；修改 Token/管理员 ID 后请重启。</div><p><a class=btn href='/settings'>返回</a> <a class=btn href='/restart'>重启机器人</a></p>")
+
+    @app.get("/forwarder", response_class=HTMLResponse)
+    async def forwarder_page(_: str = Depends(panel_auth)) -> str:
+        st = forwarder_status()
+        missing = ", ".join(st["missing_required"]) if st["missing_required"] else "-"
+        env_status = "已初始化" if st["env_exists"] else "未初始化"
+        ready_status = "可启动" if st["required_ready"] else "缺少必填配置"
+        rss_status = "已启用" if st["rss_enabled"] else "未启用"
+        init_notice = ""
+        if not st["env_exists"]:
+            init_notice = (
+                "<div class=msg>尚未生成 Forwarder 的 .env。可以先点“从示例初始化”，"
+                "再按原项目要求填写 API_ID / API_HASH / PHONE_NUMBER / BOT_TOKEN / USER_ID。</div>"
+            )
+        commands = "\n".join(
+            [
+                "docker compose --profile forwarder up -d tg-watchbot telegram-forwarder",
+                "docker compose logs -f telegram-forwarder",
+                "docker compose --profile forwarder restart telegram-forwarder",
+                "docker compose --profile forwarder run --rm telegram-forwarder",
+            ]
+        )
+        body = f"""
+<h2>TelegramForwarder 子服务</h2>
+<p class=muted>这里保留 TelegramForwarder 的完整独立能力：Telethon 用户会话监听、关键词/正则过滤、内容改写、AI 处理、RSS、Apprise 推送等。tg-watchbot 负责把它纳入同一项目目录、同一 compose 和同一管理面板。</p>
+{init_notice}
+<div class=card>
+<div class=toolbar><div><h2 style='margin:0 0 6px'>当前状态</h2><p class=muted style='margin:0'>官方镜像子服务，默认不随主服务自动启动；使用 compose profile <code>forwarder</code> 启动。</p></div><div class=actions><a class='btn' href='https://github.com/Heavrnl/TelegramForwarder' target='_blank' rel='noopener noreferrer'>上游仓库</a></div></div>
+<div class=grid>
+<div><label>配置文件</label><input value='{html_escape(str(FORWARDER_ENV_PATH.relative_to(BASE_DIR)))}' readonly></div>
+<div><label>.env 状态</label><input value='{html_escape(env_status)}' readonly></div>
+<div><label>必填项状态</label><input value='{html_escape(ready_status)}' readonly></div>
+<div><label>RSS 面板</label><input value='{html_escape(rss_status)}' readonly></div>
+</div>
+<label>缺少的必填项</label><input value='{html_escape(missing)}' readonly>
+<label>运行目录</label><textarea readonly>{html_escape(chr(10).join(st['runtime_dirs']))}</textarea>
+</div>
+<form method='post' action='/forwarder/save-form'>
+{forwarder_form_html(st['values'])}
+<div class=card><div class=form-actions><button class='btn primary' type='submit'>保存 Forwarder 表单配置</button></div><small>保存后会更新 <code>forwarder/.env</code>；如已运行容器，请重启 <code>telegram-forwarder</code> 子服务。</small></div>
+</form>
+<div class=card>
+<h2>启动命令</h2>
+<p class=muted>首次登录用户账号通常需要执行一次前台命令完成验证码/2FA；之后再用后台模式常驻即可。</p>
+<pre>{html_escape(commands)}</pre>
+<div class=form-actions>
+<form method='post' action='/forwarder/init'><button class='btn ok' type='submit'>从示例初始化</button></form>
+{f"<a class='btn primary' href='{html_escape(st['rss_url'])}' target='_blank' rel='noopener noreferrer'>打开 RSS 面板</a>" if st['rss_enabled'] else ""}
+</div>
+</div>
+<div class=card>
+<h2>完整 .env 编辑器</h2>
+<p class=muted>这里保留高级模式，便于粘贴上游原始配置或处理暂未表单化的字段。保存后同样需要按上面的 compose 命令重启 <code>telegram-forwarder</code> 子服务。</p>
+<form method='post' action='/forwarder/save'>
+<label>forwarder/.env</label>
+<textarea name='env_text' style='min-height:560px'>{html_escape(st['env_text'])}</textarea>
+<div class=form-actions><button class='btn primary' type='submit'>保存 Forwarder 配置</button></div>
+</form>
+</div>
+"""
+        return layout("TG 转发器", body)
+
+    @app.post("/forwarder/init")
+    async def forwarder_init(_: str = Depends(panel_auth)) -> RedirectResponse:
+        ensure_forwarder_workspace(copy_example_env=True)
+        return RedirectResponse("/forwarder", status_code=303)
+
+    @app.post("/forwarder/save-form", response_class=HTMLResponse)
+    async def forwarder_save_form(request: Request, _: str = Depends(panel_auth)) -> str:
+        form = await request.form()
+        values = forwarder_env_values()
+        for section in FORWARDER_ENV_SECTIONS:
+            for field in section.get("fields") or []:
+                key = str(field.get("key") or "").strip()
+                if not key:
+                    continue
+                kind = str(field.get("kind") or "input")
+                if kind == "checkbox":
+                    values[key] = "true" if env_bool(form.get(key, "false")) else "false"
+                else:
+                    values[key] = str(form.get(key, "") or "").strip()
+        write_forwarder_env_values(values)
+        st = forwarder_status()
+        status_line = "完整" if st["required_ready"] else "仍缺少：" + ", ".join(st["missing_required"])
+        return layout(
+            "Forwarder 已保存",
+            f"<div class=msg>已保存 TelegramForwarder 表单配置，当前必填项状态：{html_escape(status_line)}。</div>"
+            "<p><a class=btn href='/forwarder'>返回转发器页面</a></p>",
+        )
+
+    @app.post("/forwarder/save", response_class=HTMLResponse)
+    async def forwarder_save(_: str = Depends(panel_auth), env_text: str = Form("")) -> str:
+        write_forwarder_env_text(env_text)
+        st = forwarder_status()
+        status_line = "完整" if st["required_ready"] else "仍缺少：" + ", ".join(st["missing_required"])
+        return layout(
+            "Forwarder 已保存",
+            f"<div class=msg>已保存 TelegramForwarder 配置，当前必填项状态：{html_escape(status_line)}。</div>"
+            "<p><a class=btn href='/forwarder'>返回转发器页面</a></p>",
+        )
 
 
     @app.get("/send", response_class=HTMLResponse)

@@ -1385,5 +1385,67 @@ class MonitorRuntimeAndUpdateTest(unittest.TestCase):
         self.assertIn("/group-monitors/new?chat_id=", source)
 
 
+class ForwarderConfigTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_dir = Path(self.temp_dir.name)
+        self.old_forwarder_dir = app.FORWARDER_DIR
+        self.old_forwarder_env_path = app.FORWARDER_ENV_PATH
+        self.old_forwarder_env_example_path = app.FORWARDER_ENV_EXAMPLE_PATH
+        self.old_forwarder_runtime_dirs = app.FORWARDER_RUNTIME_DIRS
+
+        app.FORWARDER_DIR = self.base_dir / "forwarder"
+        app.FORWARDER_ENV_PATH = app.FORWARDER_DIR / ".env"
+        app.FORWARDER_ENV_EXAMPLE_PATH = app.FORWARDER_DIR / ".env.example"
+        app.FORWARDER_RUNTIME_DIRS = (
+            app.FORWARDER_DIR / "db",
+            app.FORWARDER_DIR / "logs",
+            app.FORWARDER_DIR / "sessions",
+            app.FORWARDER_DIR / "temp",
+            app.FORWARDER_DIR / "ufb" / "config",
+            app.FORWARDER_DIR / "config",
+            app.FORWARDER_DIR / "rss" / "data",
+            app.FORWARDER_DIR / "rss" / "media",
+        )
+        app.FORWARDER_DIR.mkdir(parents=True, exist_ok=True)
+        app.FORWARDER_ENV_EXAMPLE_PATH.write_text("API_ID=\nAPI_HASH=\nPHONE_NUMBER=\nBOT_TOKEN=\nUSER_ID=\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        app.FORWARDER_DIR = self.old_forwarder_dir
+        app.FORWARDER_ENV_PATH = self.old_forwarder_env_path
+        app.FORWARDER_ENV_EXAMPLE_PATH = self.old_forwarder_env_example_path
+        app.FORWARDER_RUNTIME_DIRS = self.old_forwarder_runtime_dirs
+        self.temp_dir.cleanup()
+
+    def test_forwarder_init_copies_example_and_creates_runtime_dirs(self) -> None:
+        created = app.ensure_forwarder_workspace(copy_example_env=True)
+        self.assertTrue(created)
+        self.assertTrue(app.FORWARDER_ENV_PATH.exists())
+        self.assertEqual(
+            "API_ID=\nAPI_HASH=\nPHONE_NUMBER=\nBOT_TOKEN=\nUSER_ID=\n",
+            app.FORWARDER_ENV_PATH.read_text(encoding="utf-8"),
+        )
+        for path in app.FORWARDER_RUNTIME_DIRS:
+            self.assertTrue(path.exists(), str(path))
+
+    def test_forwarder_status_reports_missing_required_keys(self) -> None:
+        app.write_forwarder_env_text(
+            "\n".join(
+                [
+                    "API_ID=12345",
+                    "API_HASH=hash-value",
+                    "PHONE_NUMBER=+123456789",
+                    "BOT_TOKEN=",
+                    "USER_ID=777",
+                    "RSS_ENABLED=true",
+                ]
+            )
+        )
+        status = app.forwarder_status()
+        self.assertEqual(["BOT_TOKEN"], status["missing_required"])
+        self.assertTrue(status["rss_enabled"])
+        self.assertEqual("http://127.0.0.1:9804", status["rss_url"])
+
+
 if __name__ == "__main__":
     unittest.main()
