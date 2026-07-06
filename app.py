@@ -163,6 +163,9 @@ MIN_INTERVAL_SECONDS = 60
 DEFAULT_MONITOR_MESSAGE_DELETE_AFTER_MINUTES = 60
 DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS = 30
 DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS = 300
+DEFAULT_RELAY_VERIFY_TIMEOUT_SECONDS = 180
+DEFAULT_TURNSTILE_VERIFY_TIMEOUT_SECONDS = 600
+DEFAULT_RELAY_WELCOME_MESSAGE = "已连接客服/管理员。你发来的消息会转交给管理员，请直接输入内容。"
 
 DEFAULT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -349,6 +352,20 @@ def init_db() -> None:
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_forum_topics_chat_thread
             ON forum_topics(admin_chat_id, message_thread_id);
+            CREATE TABLE IF NOT EXISTS relay_user_state (
+                user_id INTEGER PRIMARY KEY,
+                verified INTEGER DEFAULT 0,
+                verify_mode TEXT DEFAULT '',
+                verify_answer TEXT DEFAULT '',
+                verify_token TEXT DEFAULT '',
+                verify_expires_at TEXT,
+                verified_at TEXT,
+                welcome_sent_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_user_state_verify_token
+            ON relay_user_state(verify_token);
             """
         )
         for sql in [
@@ -365,6 +382,19 @@ def init_db() -> None:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def now_dt() -> datetime:
+    return datetime.now(timezone.utc).astimezone()
+
+
+def parse_iso_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except Exception:
+        return None
 
 
 def html_escape(text: Any) -> str:
@@ -420,6 +450,266 @@ def set_block(user_id: int, blocked: bool) -> None:
         conn.commit()
 
 
+def get_relay_user_state(user_id: int) -> sqlite3.Row | None:
+    with closing(db()) as conn:
+        return conn.execute("SELECT * FROM relay_user_state WHERE user_id=?", (user_id,)).fetchone()
+
+
+def get_relay_user_state_by_token(token: str) -> sqlite3.Row | None:
+    token = str(token or "").strip()
+    if not token:
+        return None
+    with closing(db()) as conn:
+        return conn.execute("SELECT * FROM relay_user_state WHERE verify_token=?", (token,)).fetchone()
+
+
+def save_relay_user_state(user_id: int, **fields: Any) -> None:
+    allowed = {
+        "verified",
+        "verify_mode",
+        "verify_answer",
+        "verify_token",
+        "verify_expires_at",
+        "verified_at",
+        "welcome_sent_at",
+    }
+    ts = now_iso()
+    row = get_relay_user_state(user_id)
+    values: dict[str, Any] = {
+        "verified": 0,
+        "verify_mode": "",
+        "verify_answer": "",
+        "verify_token": "",
+        "verify_expires_at": None,
+        "verified_at": None,
+        "welcome_sent_at": None,
+        "created_at": ts,
+        "updated_at": ts,
+    }
+    if row:
+        for key in values:
+            if key in row.keys():
+                values[key] = row[key]
+        values["created_at"] = row["created_at"]
+    for key, value in fields.items():
+        if key in allowed:
+            values[key] = value
+    values["updated_at"] = ts
+    with closing(db()) as conn:
+        conn.execute(
+            """
+            INSERT INTO relay_user_state(
+                user_id, verified, verify_mode, verify_answer, verify_token,
+                verify_expires_at, verified_at, welcome_sent_at, created_at, updated_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                verified=excluded.verified,
+                verify_mode=excluded.verify_mode,
+                verify_answer=excluded.verify_answer,
+                verify_token=excluded.verify_token,
+                verify_expires_at=excluded.verify_expires_at,
+                verified_at=excluded.verified_at,
+                welcome_sent_at=excluded.welcome_sent_at,
+                updated_at=excluded.updated_at
+            """,
+            (
+                user_id,
+                int(values["verified"] or 0),
+                values["verify_mode"] or "",
+                values["verify_answer"] or "",
+                values["verify_token"] or "",
+                values["verify_expires_at"],
+                values["verified_at"],
+                values["welcome_sent_at"],
+                values["created_at"],
+                values["updated_at"],
+            ),
+        )
+        conn.commit()
+
+
+def clear_relay_verification_state(user_id: int, keep_verified: bool = False) -> None:
+    state = get_relay_user_state(user_id)
+    verified = int(state["verified"]) if state and keep_verified else 0
+    verified_at = state["verified_at"] if state and keep_verified else None
+    save_relay_user_state(
+        user_id,
+        verified=verified,
+        verify_mode="",
+        verify_answer="",
+        verify_token="",
+        verify_expires_at=None,
+        verified_at=verified_at,
+    )
+
+
+def mark_relay_user_verified(user_id: int) -> None:
+    save_relay_user_state(
+        user_id,
+        verified=1,
+        verify_mode="",
+        verify_answer="",
+        verify_token="",
+        verify_expires_at=None,
+        verified_at=now_iso(),
+    )
+
+
+def relay_user_has_history(user_id: int) -> bool:
+    with closing(db()) as conn:
+        row = conn.execute("SELECT 1 FROM inbox_messages WHERE user_id=? LIMIT 1", (user_id,)).fetchone()
+        if row:
+            return True
+        topic = conn.execute("SELECT 1 FROM forum_topics WHERE user_id=? LIMIT 1", (user_id,)).fetchone()
+        return bool(topic)
+
+
+def relay_user_is_verified(user_id: int) -> bool:
+    state = get_relay_user_state(user_id)
+    return bool(state and int(state["verified"] or 0))
+
+
+def current_turnstile_verify_url(verify_token: str) -> str:
+    base_url = relay_public_base_url()
+    if not base_url:
+        return ""
+    return f"{base_url}/verify/turnstile?token={quote_plus(verify_token)}"
+
+
+def build_turnstile_verify_markup(verify_token: str) -> dict[str, Any] | None:
+    verify_url = current_turnstile_verify_url(verify_token)
+    if not verify_url:
+        return None
+    return {"inline_keyboard": [[{"text": "点击验证", "url": verify_url}]]}
+
+
+def begin_local_verification(user_id: int, mode: str) -> str | None:
+    expires_at = datetime.fromtimestamp(time.time() + relay_verify_timeout_seconds(mode), timezone.utc).astimezone().isoformat(timespec="seconds")
+    answer = ""
+    payload = None
+    if mode == "math":
+        a = secrets.randbelow(10)
+        b = secrets.randbelow(10)
+        answer = str(a + b)
+        payload = f"{a} + {b} = ?"
+    save_relay_user_state(
+        user_id,
+        verified=0,
+        verify_mode=mode,
+        verify_answer=answer,
+        verify_token="",
+        verify_expires_at=expires_at,
+    )
+    return payload
+
+
+def begin_turnstile_verification(user_id: int) -> str:
+    verify_token = secrets.token_urlsafe(24)
+    expires_at = datetime.fromtimestamp(time.time() + relay_verify_timeout_seconds("turnstile"), timezone.utc).astimezone().isoformat(timespec="seconds")
+    save_relay_user_state(
+        user_id,
+        verified=0,
+        verify_mode="turnstile",
+        verify_answer="",
+        verify_token=verify_token,
+        verify_expires_at=expires_at,
+    )
+    return verify_token
+
+
+def verify_state_expired(state: sqlite3.Row | None) -> bool:
+    if not state:
+        return False
+    expires_at = parse_iso_datetime(state["verify_expires_at"])
+    if not expires_at:
+        return False
+    return expires_at <= now_dt()
+
+
+async def send_verification_prompt(message: Message, user_id: int, mode: str, payload: str | None = None, verify_token: str | None = None) -> None:
+    kwargs: dict[str, Any] = {}
+    if mode == "turnstile":
+        reply_markup = build_turnstile_verify_markup(str(verify_token or ""))
+        if not reply_markup:
+            await message.answer("验证模式已开启，但尚未配置 PUBLIC_BASE_URL 或 Turnstile 密钥，请联系管理员。")
+            return
+        kwargs["reply_markup"] = reply_markup
+    await message.answer(verification_prompt_text(mode, payload), **kwargs)
+
+
+async def ensure_relay_user_verified(message: Message, user_id: int, send_welcome_on_autopass: bool = True) -> bool:
+    mode = relay_verify_mode()
+    state = get_relay_user_state(user_id)
+    if mode == "off":
+        if not relay_user_is_verified(user_id):
+            mark_relay_user_verified(user_id)
+        if send_welcome_on_autopass:
+            await send_relay_welcome(user_id)
+        return True
+    if not relay_user_is_verified(user_id) and relay_user_has_history(user_id):
+        mark_relay_user_verified(user_id)
+        if send_welcome_on_autopass:
+            await send_relay_welcome(user_id)
+        return True
+    if relay_user_is_verified(user_id):
+        return True
+    text = (getattr(message, "text", None) or "").strip()
+    if state and verify_state_expired(state):
+        if str(state["verify_mode"] or "") == "turnstile":
+            clear_relay_verification_state(user_id)
+            state = None
+        else:
+            clear_relay_verification_state(user_id)
+            set_block(user_id, True)
+            await message.answer("验证已超时，你已被自动封禁。")
+            return False
+    if mode == "turnstile":
+        verify_token = str(state["verify_token"] or "") if state else ""
+        if not verify_token:
+            verify_token = begin_turnstile_verification(user_id)
+        await send_verification_prompt(message, user_id, mode, verify_token=verify_token)
+        return False
+    if state and str(state["verify_mode"] or "") == mode and parse_iso_datetime(state["verify_expires_at"]):
+        passed = False
+        if mode == "sticker" and getattr(message, "sticker", None):
+            passed = True
+        elif mode == "math" and text and text == str(state["verify_answer"] or ""):
+            passed = True
+        if passed:
+            mark_relay_user_verified(user_id)
+            await send_relay_welcome(user_id, force=True, intro="✅ 验证通过，可以开始发送消息了。")
+        else:
+            clear_relay_verification_state(user_id)
+            set_block(user_id, True)
+            await message.answer("验证失败，你已被自动封禁。")
+        return False
+    payload = begin_local_verification(user_id, mode)
+    await send_verification_prompt(message, user_id, mode, payload=payload)
+    return False
+
+
+async def verify_turnstile_response(verify_response: str, remote_ip: str | None = None) -> bool:
+    secret = relay_turnstile_secret_key()
+    if not secret or not verify_response:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+                data={
+                    "secret": secret,
+                    "response": verify_response,
+                    "remoteip": remote_ip or "",
+                },
+            )
+        data = resp.json() if hasattr(resp, "json") else {}
+        return bool(data.get("success"))
+    except Exception:
+        logger.exception("turnstile verification failed")
+        return False
+
+
 def all_admin_chat_ids() -> list[int]:
     if admin_chat_ids:
         return list(dict.fromkeys(admin_chat_ids[:3]))
@@ -449,6 +739,54 @@ def monitor_read_command() -> str:
     if not raw:
         return "/r"
     return raw if raw.startswith("/") else f"/{raw}"
+
+
+def relay_verify_mode() -> str:
+    load_dotenv(ENV_PATH, override=True)
+    mode = os.getenv("RELAY_VERIFY_MODE", "off").strip().lower()
+    return mode if mode in {"off", "math", "sticker", "turnstile"} else "off"
+
+
+def relay_verify_timeout_seconds(mode: str | None = None) -> int:
+    load_dotenv(ENV_PATH, override=True)
+    active_mode = mode or relay_verify_mode()
+    default_value = (
+        DEFAULT_TURNSTILE_VERIFY_TIMEOUT_SECONDS
+        if active_mode == "turnstile"
+        else DEFAULT_RELAY_VERIFY_TIMEOUT_SECONDS
+    )
+    raw = os.getenv("RELAY_VERIFY_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return default_value
+    try:
+        return max(30, int(raw))
+    except Exception:
+        return default_value
+
+
+def relay_public_base_url() -> str:
+    load_dotenv(ENV_PATH, override=True)
+    return os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+
+
+def relay_turnstile_site_key() -> str:
+    load_dotenv(ENV_PATH, override=True)
+    return os.getenv("TURNSTILE_SITE_KEY", "").strip()
+
+
+def relay_turnstile_secret_key() -> str:
+    load_dotenv(ENV_PATH, override=True)
+    return os.getenv("TURNSTILE_SECRET_KEY", "").strip()
+
+
+def relay_welcome_message() -> str:
+    load_dotenv(ENV_PATH, override=True)
+    return env_decode_multiline(os.getenv("RELAY_WELCOME_MESSAGE", DEFAULT_RELAY_WELCOME_MESSAGE))
+
+
+def relay_welcome_buttons_raw() -> str:
+    load_dotenv(ENV_PATH, override=True)
+    return env_decode_multiline(os.getenv("RELAY_WELCOME_BUTTONS", "")).strip()
 
 
 def role_bot_token(role: str) -> str:
@@ -524,6 +862,75 @@ def command_matches(text: str | None, command: str) -> bool:
         return False
     token_base = token.split("@", 1)[0]
     return token_base == command
+
+
+def parse_welcome_buttons(raw: str | None) -> list[list[dict[str, str]]]:
+    rows: list[list[dict[str, str]]] = []
+    for row_text in re.split(r"(?:\r?\n)+|(?:\s*,\s*)", str(raw or "").strip()):
+        row: list[dict[str, str]] = []
+        for item in row_text.split("|"):
+            part = item.strip()
+            if " - " not in part:
+                continue
+            text, url = part.split(" - ", 1)
+            text = text.strip()
+            url = url.strip()
+            if text and url:
+                row.append({"text": text[:64], "url": url})
+        if row:
+            rows.append(row)
+    return rows
+
+
+def relay_welcome_reply_markup() -> dict[str, Any] | None:
+    rows = parse_welcome_buttons(relay_welcome_buttons_raw())
+    if not rows:
+        return None
+    return {"inline_keyboard": rows}
+
+
+async def send_relay_welcome(user_id: int, force: bool = False, intro: str | None = None) -> bool:
+    relay_bot = role_bot_client(BOT_ROLE_RELAY)
+    if not relay_bot:
+        return False
+    state = get_relay_user_state(user_id)
+    if state and state["welcome_sent_at"] and not force:
+        return False
+    welcome_text = str(relay_welcome_message() or "").strip()
+    intro_text = str(intro or "").strip()
+    pieces = [piece for piece in [intro_text, welcome_text] if piece]
+    if not pieces:
+        return False
+    payload = "\n\n".join(html_escape(piece) for piece in pieces)
+    kwargs: dict[str, Any] = {"disable_web_page_preview": True}
+    reply_markup = relay_welcome_reply_markup()
+    if reply_markup:
+        kwargs["reply_markup"] = reply_markup
+    await relay_bot.send_message(user_id, payload, **kwargs)
+    save_relay_user_state(user_id, welcome_sent_at=now_iso())
+    return True
+
+
+def verification_prompt_text(mode: str, payload: str | None = None) -> str:
+    timeout_seconds = relay_verify_timeout_seconds(mode)
+    timeout_minutes = max(1, timeout_seconds // 60)
+    if mode == "sticker":
+        return (
+            "🔒 安全验证\n\n"
+            "请发送任意一个贴纸完成验证。\n\n"
+            f"请在 {timeout_minutes} 分钟内完成，超时或验证失败会被自动封禁。"
+        )
+    if mode == "math":
+        return (
+            "🔒 安全验证\n\n"
+            f"请直接发送答案：{payload or '0 + 0 = ?'}\n\n"
+            f"请在 {timeout_minutes} 分钟内完成，超时或验证失败会被自动封禁。"
+        )
+    return (
+        "🔒 安全验证\n\n"
+        "请点击下方按钮完成 Cloudflare Turnstile 验证，完成后回到 Telegram 继续发送消息。\n\n"
+        f"本次验证链接 {timeout_minutes} 分钟内有效。"
+    )
 
 
 def admin_route_mode() -> str:
@@ -1805,7 +2212,8 @@ async def start(message: Message) -> None:
     if is_blocked(uid):
         await message.answer("你当前无法发送消息。")
         return
-    await message.answer("已连接客服/管理员。你发来的消息会转交给管理员，请直接输入内容。")
+    if await ensure_relay_user_verified(message, uid, send_welcome_on_autopass=False):
+        await send_relay_welcome(uid, force=True)
 
 
 async def send_text_to_user_from_admin(message: Message, args: str | None, command_name: str) -> None:
@@ -2075,7 +2483,7 @@ async def admin_plain_message(message: Message) -> None:
             "/send <user_id> <内容>\n"
             "/reply <user_id> <内容>\n"
             f"{monitor_read_command()} 标记当前聊天中此前的监控通知已读\n"
-            "或直接回复某条用户消息（支持文字/图片/文件等）。若已启用 Forum 模式，也可以在用户 Topic 内直接发消息；也可以打开面板的「主动发消息」。"
+            "或直接回复某条用户消息（支持文字/图片/文件等）。若已启用 Forum 模式，也可以在用户 Topic 内直接打字或发媒体，不必再手动引用原消息；也可以打开面板的「主动发消息」。"
         )
 
 
@@ -2110,6 +2518,8 @@ async def user_message(message: Message) -> None:
         return
     if rate_limited(uid):
         await message.answer("发送太快了，请稍后再试。")
+        return
+    if not await ensure_relay_user_verified(message, uid):
         return
     inbox_id = create_inbox_message(message, uid, full, username)
     spam_hits = spam_keyword_hits(message.text or message.caption or "")
@@ -2785,6 +3195,13 @@ def env_values() -> dict[str, str]:
         "MONITOR_BOT_TOKEN": os.getenv("MONITOR_BOT_TOKEN", ""),
         "GROUP_BOT_TOKEN": os.getenv("GROUP_BOT_TOKEN", ""),
         "MONITOR_READ_COMMAND": os.getenv("MONITOR_READ_COMMAND", "/r"),
+        "RELAY_VERIFY_MODE": os.getenv("RELAY_VERIFY_MODE", "off"),
+        "RELAY_VERIFY_TIMEOUT_SECONDS": os.getenv("RELAY_VERIFY_TIMEOUT_SECONDS", ""),
+        "PUBLIC_BASE_URL": os.getenv("PUBLIC_BASE_URL", ""),
+        "TURNSTILE_SITE_KEY": os.getenv("TURNSTILE_SITE_KEY", ""),
+        "TURNSTILE_SECRET_KEY": os.getenv("TURNSTILE_SECRET_KEY", ""),
+        "RELAY_WELCOME_MESSAGE": env_decode_multiline(os.getenv("RELAY_WELCOME_MESSAGE", DEFAULT_RELAY_WELCOME_MESSAGE)),
+        "RELAY_WELCOME_BUTTONS": env_decode_multiline(os.getenv("RELAY_WELCOME_BUTTONS", "")),
         "ADMIN_CHAT_ID": os.getenv("ADMIN_CHAT_ID", ""),
         "ADMIN_ROUTE_MODE": os.getenv("ADMIN_ROUTE_MODE", "direct"),
         "ADMIN_FORUM_GROUP_ID": os.getenv("ADMIN_FORUM_GROUP_ID", ""),
@@ -2812,6 +3229,14 @@ def parse_env_file(path: Path) -> dict[str, str]:
         key, value = line.split("=", 1)
         values[key.strip()] = value.strip()
     return values
+
+
+def env_encode_multiline(value: Any) -> str:
+    return str(value or "").replace("\r\n", "\n").replace("\n", "\\n")
+
+
+def env_decode_multiline(value: Any) -> str:
+    return str(value or "").replace("\\n", "\n")
 
 
 def forwarder_env_defaults() -> dict[str, str]:
@@ -2853,6 +3278,13 @@ def write_env_values(values: dict[str, str]) -> None:
         f"MONITOR_BOT_TOKEN={values.get('MONITOR_BOT_TOKEN','')}",
         f"GROUP_BOT_TOKEN={values.get('GROUP_BOT_TOKEN','')}",
         f"MONITOR_READ_COMMAND={values.get('MONITOR_READ_COMMAND','/r')}",
+        f"RELAY_VERIFY_MODE={values.get('RELAY_VERIFY_MODE','off')}",
+        f"RELAY_VERIFY_TIMEOUT_SECONDS={values.get('RELAY_VERIFY_TIMEOUT_SECONDS','')}",
+        f"PUBLIC_BASE_URL={values.get('PUBLIC_BASE_URL','')}",
+        f"TURNSTILE_SITE_KEY={values.get('TURNSTILE_SITE_KEY','')}",
+        f"TURNSTILE_SECRET_KEY={values.get('TURNSTILE_SECRET_KEY','')}",
+        f"RELAY_WELCOME_MESSAGE={env_encode_multiline(values.get('RELAY_WELCOME_MESSAGE', DEFAULT_RELAY_WELCOME_MESSAGE))}",
+        f"RELAY_WELCOME_BUTTONS={env_encode_multiline(values.get('RELAY_WELCOME_BUTTONS',''))}",
         f"ADMIN_CHAT_ID={values.get('ADMIN_CHAT_ID','')}",
         f"ADMIN_ROUTE_MODE={values.get('ADMIN_ROUTE_MODE','direct')}",
         f"ADMIN_FORUM_GROUP_ID={values.get('ADMIN_FORUM_GROUP_ID','')}",
@@ -3348,7 +3780,7 @@ def create_panel_app() -> FastAPI:
     @app.middleware("http")
     async def require_login_middleware(request: Request, call_next):
         public_paths = {"/login", "/health", "/favicon.ico"}
-        if request.url.path in public_paths or is_logged_in(request):
+        if request.url.path in public_paths or request.url.path.startswith("/verify/") or is_logged_in(request):
             return await call_next(request)
         return RedirectResponse("/login", status_code=303)
 
@@ -3373,6 +3805,61 @@ def create_panel_app() -> FastAPI:
         resp = RedirectResponse("/login", status_code=303)
         resp.delete_cookie("tg_watchbot_session")
         return resp
+
+    def turnstile_page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
+        html_body = f"""<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>{html_escape(title)}</title><script src='https://challenges.cloudflare.com/turnstile/v0/api.js' async defer></script>
+<style>
+body{{margin:0;font-family:ui-sans-serif,system-ui,sans-serif;background:#f5f1e8;color:#1f2937}}
+.wrap{{max-width:560px;margin:6vh auto;padding:24px}}
+.card{{background:#fffdf8;border:1px solid #d6d0c4;border-radius:18px;padding:28px;box-shadow:0 18px 50px rgba(60,42,10,.10)}}
+h1{{margin:0 0 14px;font-size:28px}}p{{line-height:1.7;margin:12px 0}}
+.muted{{color:#6b7280}}.ok{{color:#166534}}.bad{{color:#b91c1c}}
+button{{margin-top:18px;background:#0f766e;color:#fff;border:0;border-radius:999px;padding:12px 20px;font-size:15px;cursor:pointer}}
+button[disabled]{{opacity:.45;cursor:not-allowed}}
+</style></head><body><div class='wrap'><div class='card'>{body}</div></div></body></html>"""
+        return HTMLResponse(html_body, status_code=status_code)
+
+    @app.get("/verify/turnstile", response_class=HTMLResponse)
+    async def turnstile_verify_page(token: str = "") -> HTMLResponse:
+        state = get_relay_user_state_by_token(token)
+        if not state or str(state["verify_mode"] or "") != "turnstile":
+            return turnstile_page("验证无效", "<h1 class='bad'>链接无效</h1><p>这个验证链接不存在，或者已经被使用。</p>", 400)
+        if verify_state_expired(state):
+            clear_relay_verification_state(int(state["user_id"]))
+            return turnstile_page("验证过期", "<h1 class='bad'>验证已过期</h1><p>请回到 Telegram，重新给机器人发送任意消息获取新的验证链接。</p>", 400)
+        site_key = relay_turnstile_site_key()
+        if not site_key or not relay_turnstile_secret_key():
+            return turnstile_page("验证未配置", "<h1 class='bad'>Turnstile 未配置完成</h1><p>请先在面板填写站点 Key、密钥和公开访问地址。</p>", 503)
+        body = f"""<h1>完成安全验证</h1>
+<p>验证通过后，你就可以回到 Telegram 继续和机器人聊天。</p>
+<form method='post'>
+<input type='hidden' name='token' value='{html_escape(token)}'>
+<div class='cf-turnstile' data-sitekey='{html_escape(site_key)}' data-callback='onTurnstileDone'></div>
+<button id='submit-btn' type='submit' disabled>提交验证</button>
+</form>
+<p class='muted'>如果页面长时间没有反应，请刷新后重试。</p>
+<script>function onTurnstileDone(){{document.getElementById('submit-btn').disabled=false;}}</script>"""
+        return turnstile_page("Turnstile 验证", body)
+
+    @app.post("/verify/turnstile", response_class=HTMLResponse)
+    async def turnstile_verify_submit(request: Request) -> HTMLResponse:
+        form = await request.form()
+        token = str(form.get("token", "")).strip()
+        verify_response = str(form.get("cf-turnstile-response", "")).strip()
+        state = get_relay_user_state_by_token(token)
+        if not state or str(state["verify_mode"] or "") != "turnstile":
+            return turnstile_page("验证无效", "<h1 class='bad'>链接无效</h1><p>这个验证链接不存在，或者已经被使用。</p>", 400)
+        if verify_state_expired(state):
+            clear_relay_verification_state(int(state["user_id"]))
+            return turnstile_page("验证过期", "<h1 class='bad'>验证已过期</h1><p>请回到 Telegram，重新给机器人发送任意消息获取新的验证链接。</p>", 400)
+        remote_ip = getattr(getattr(request, "client", None), "host", None)
+        if not await verify_turnstile_response(verify_response, remote_ip):
+            return turnstile_page("验证失败", "<h1 class='bad'>验证失败</h1><p>Cloudflare Turnstile 没有通过，请返回上一页重新完成验证。</p>", 400)
+        user_id = int(state["user_id"])
+        mark_relay_user_verified(user_id)
+        await send_relay_welcome(user_id, force=True, intro="✅ 验证通过，现在可以回到 Telegram 继续发送消息。")
+        return turnstile_page("验证成功", "<h1 class='ok'>验证成功</h1><p>可以回到 Telegram 继续发送消息了，这个页面可以直接关闭。</p>")
 
     @app.get("/", response_class=HTMLResponse)
     async def index(_: str = Depends(panel_auth)) -> str:
@@ -3818,6 +4305,12 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
 <h3>角色 Bot Token（可选覆盖）</h3><p class=muted>留空则继承上面的共享 Token。Relay=双向机器人，Monitor=监控推送，Group=群监听。</p>
 <div class=grid><div><label>RELAY_BOT_TOKEN</label><input name=RELAY_BOT_TOKEN value='{html_escape(v['RELAY_BOT_TOKEN'])}' placeholder='双向机器人专用'></div><div><label>MONITOR_BOT_TOKEN</label><input name=MONITOR_BOT_TOKEN value='{html_escape(v['MONITOR_BOT_TOKEN'])}' placeholder='监控推送专用'></div><div><label>GROUP_BOT_TOKEN</label><input name=GROUP_BOT_TOKEN value='{html_escape(v['GROUP_BOT_TOKEN'])}' placeholder='群监听专用'></div></div>
 <div class=grid><div><label>监控已读快捷命令</label><input name=MONITOR_READ_COMMAND value='{html_escape(v['MONITOR_READ_COMMAND'])}' placeholder='/r'></div><div><label>命令说明</label><small class=muted>在管理员聊天发送该命令，会将此前监控通知标记为已读，并在删除时间到达后连同命令和确认回复一起删除。</small></div></div>
+<h3>新用户验证 / 欢迎消息</h3><p class=muted>参考 RelayGo 的思路：新用户可先过本地验证或 Cloudflare Turnstile，再进入私聊转发链路。已存在历史会话的老用户会自动放行，避免升级后打断。</p>
+<div class=grid><div><label>验证模式</label><select name=RELAY_VERIFY_MODE><option value='off' {'selected' if v['RELAY_VERIFY_MODE'] == 'off' else ''}>off 关闭</option><option value='math' {'selected' if v['RELAY_VERIFY_MODE'] == 'math' else ''}>math 算术题</option><option value='sticker' {'selected' if v['RELAY_VERIFY_MODE'] == 'sticker' else ''}>sticker 贴纸</option><option value='turnstile' {'selected' if v['RELAY_VERIFY_MODE'] == 'turnstile' else ''}>turnstile Cloudflare</option></select></div><div><label>验证时限（秒）</label><input name=RELAY_VERIFY_TIMEOUT_SECONDS type=number min=30 value='{html_escape(v['RELAY_VERIFY_TIMEOUT_SECONDS'])}' placeholder='本地默认 180，Turnstile 默认 600'></div></div>
+<div class=grid><div><label>PUBLIC_BASE_URL</label><input name=PUBLIC_BASE_URL value='{html_escape(v['PUBLIC_BASE_URL'])}' placeholder='https://bot.example.com'></div><div><label>用途说明</label><small class=muted>Turnstile 验证按钮会跳到这个公开地址下的 <code>/verify/turnstile</code> 页面；如果只用本地验证，可以留空。</small></div></div>
+<div class=grid><div><label>TURNSTILE_SITE_KEY</label><input name=TURNSTILE_SITE_KEY value='{html_escape(v['TURNSTILE_SITE_KEY'])}' placeholder='0x4AAAA...'></div><div><label>TURNSTILE_SECRET_KEY</label><input name=TURNSTILE_SECRET_KEY value='{html_escape(v['TURNSTILE_SECRET_KEY'])}' placeholder='0x4AAAA...'></div></div>
+<label>欢迎消息</label><textarea name=RELAY_WELCOME_MESSAGE placeholder='可留空禁用欢迎消息'>{html_escape(v['RELAY_WELCOME_MESSAGE'])}</textarea>
+<label>欢迎按钮</label><textarea name=RELAY_WELCOME_BUTTONS placeholder='按钮1 - https://example.com | 按钮2 - https://t.me/xxx, 按钮3 - https://docs.example.com'>{html_escape(v['RELAY_WELCOME_BUTTONS'])}</textarea>
 <div class=grid><div><label>管理员路由模式</label><select name=ADMIN_ROUTE_MODE><option value='direct' {'selected' if v['ADMIN_ROUTE_MODE'] == 'direct' else ''}>direct 直发管理员</option><option value='forum_topic' {'selected' if v['ADMIN_ROUTE_MODE'] == 'forum_topic' else ''}>forum_topic 私有超级群 Topic</option></select></div><div><label>管理员 ADMIN_CHAT_ID</label><input name=ADMIN_CHAT_ID value='{html_escape(v['ADMIN_CHAT_ID'])}' placeholder='直发模式可填最多 3 个，逗号分隔'></div></div>
 <label>ADMIN_FORUM_GROUP_ID（私有超级群 ID）</label><input name=ADMIN_FORUM_GROUP_ID value='{html_escape(v['ADMIN_FORUM_GROUP_ID'])}' placeholder='forum_topic 模式必填，例如 -1001234567890'>
 <h3>TG 用户会话（可选）</h3><p class=muted>仅用于“TG 群监听 -> 监听来源=用户会话”，适合 Bot 无法加入的群。填写后需重启。</p>
@@ -3848,7 +4341,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         cfg_save(cfg)
 
     @app.post("/settings", response_class=HTMLResponse)
-    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), RELAY_BOT_TOKEN: str = Form(""), MONITOR_BOT_TOKEN: str = Form(""), GROUP_BOT_TOKEN: str = Form(""), MONITOR_READ_COMMAND: str = Form("/r"), ADMIN_CHAT_ID: str = Form(""), ADMIN_ROUTE_MODE: str = Form("direct"), ADMIN_FORUM_GROUP_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440), CLEANUP_MESSAGE_DELETE_MODE: str = Form("ttl")) -> str:
+    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), RELAY_BOT_TOKEN: str = Form(""), MONITOR_BOT_TOKEN: str = Form(""), GROUP_BOT_TOKEN: str = Form(""), MONITOR_READ_COMMAND: str = Form("/r"), RELAY_VERIFY_MODE: str = Form("off"), RELAY_VERIFY_TIMEOUT_SECONDS: str = Form(""), PUBLIC_BASE_URL: str = Form(""), TURNSTILE_SITE_KEY: str = Form(""), TURNSTILE_SECRET_KEY: str = Form(""), RELAY_WELCOME_MESSAGE: str = Form(DEFAULT_RELAY_WELCOME_MESSAGE), RELAY_WELCOME_BUTTONS: str = Form(""), ADMIN_CHAT_ID: str = Form(""), ADMIN_ROUTE_MODE: str = Form("direct"), ADMIN_FORUM_GROUP_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440), CLEANUP_MESSAGE_DELETE_MODE: str = Form("ttl")) -> str:
         save_panel_settings(locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED}, CLEANUP_INTERVAL_MINUTES, CLEANUP_MESSAGE_DELETE_AFTER_MINUTES, CLEANUP_RETENTION_MINUTES, CLEANUP_MESSAGE_DELETE_MODE)
         return layout("已保存", "<div class=msg>已保存，不会自动重启；修改 Token/管理员 ID 后请重启。</div><p><a class=btn href='/settings'>返回</a> <a class=btn href='/restart'>重启机器人</a></p>")
 
@@ -4065,10 +4558,19 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
     async def users_page(_: str = Depends(panel_auth)) -> str:
         v = env_values()
         with closing(db()) as conn:
-            rows = conn.execute("SELECT user_id, username, full_name, blocked, note, updated_at FROM users ORDER BY updated_at DESC LIMIT 300").fetchall()
+            rows = conn.execute(
+                """
+                SELECT u.user_id, u.username, u.full_name, u.blocked, u.note, u.updated_at,
+                       s.verified, s.verify_mode, s.verify_expires_at
+                FROM users u
+                LEFT JOIN relay_user_state s ON s.user_id = u.user_id
+                ORDER BY u.updated_at DESC LIMIT 300
+                """
+            ).fetchall()
         trs = []
         for u in rows:
-            status_txt = "封禁" if u["blocked"] else "正常"
+            verify_txt = "已验证" if int(u["verified"] or 0) else (f"待验证:{u['verify_mode']}" if u["verify_mode"] else "未接入验证")
+            status_txt = "封禁" if u["blocked"] else f"正常 / {verify_txt}"
             action = "unblock" if u["blocked"] else "block"
             action_txt = "解封" if u["blocked"] else "封禁"
             trs.append(f"""<tr><td><b>{html_escape(u['full_name'] or u['user_id'])}</b><br><small>{u['user_id']} @{html_escape(u['username'] or '')}</small></td><td><span class=badge>{status_txt}</span><br><small>{html_escape(u['updated_at'])}</small></td><td>{html_escape(u['note'] or '')}</td><td><form method=post action='/users/{u['user_id']}/note'><input name=note value='{html_escape(u['note'] or '')}'><button class=btn type=submit>备注</button></form><div class=actions><a class=btn href='/send?user_id={u['user_id']}'>发消息</a><a class='btn danger' href='/users/{u['user_id']}/{action}'>{action_txt}</a></div></td></tr>""")
@@ -4076,6 +4578,10 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
 <label>共享 Telegram Bot Token</label><input name=TELEGRAM_BOT_TOKEN value='{html_escape(v['TELEGRAM_BOT_TOKEN'])}' placeholder='123456:ABC...'>
 <div class=grid><div><label>RELAY_BOT_TOKEN</label><input name=RELAY_BOT_TOKEN value='{html_escape(v['RELAY_BOT_TOKEN'])}'></div><div><label>MONITOR_BOT_TOKEN</label><input name=MONITOR_BOT_TOKEN value='{html_escape(v['MONITOR_BOT_TOKEN'])}'></div><div><label>GROUP_BOT_TOKEN</label><input name=GROUP_BOT_TOKEN value='{html_escape(v['GROUP_BOT_TOKEN'])}'></div></div>
 <div class=grid><div><label>监控已读快捷命令</label><input name=MONITOR_READ_COMMAND value='{html_escape(v['MONITOR_READ_COMMAND'])}' placeholder='/r'></div><div><label>说明</label><small class=muted>发送该命令会把此前监控通知标记为已读，并把命令及确认回复一起加入删除队列。</small></div></div>
+<div class=grid><div><label>验证模式</label><select name=RELAY_VERIFY_MODE><option value='off' {'selected' if v['RELAY_VERIFY_MODE'] == 'off' else ''}>off</option><option value='math' {'selected' if v['RELAY_VERIFY_MODE'] == 'math' else ''}>math</option><option value='sticker' {'selected' if v['RELAY_VERIFY_MODE'] == 'sticker' else ''}>sticker</option><option value='turnstile' {'selected' if v['RELAY_VERIFY_MODE'] == 'turnstile' else ''}>turnstile</option></select></div><div><label>验证时限（秒）</label><input name=RELAY_VERIFY_TIMEOUT_SECONDS value='{html_escape(v['RELAY_VERIFY_TIMEOUT_SECONDS'])}' placeholder='180 / 600'></div></div>
+<div class=grid><div><label>PUBLIC_BASE_URL</label><input name=PUBLIC_BASE_URL value='{html_escape(v['PUBLIC_BASE_URL'])}' placeholder='https://bot.example.com'></div><div><label>TURNSTILE_SITE_KEY</label><input name=TURNSTILE_SITE_KEY value='{html_escape(v['TURNSTILE_SITE_KEY'])}'></div></div>
+<div class=grid><div><label>TURNSTILE_SECRET_KEY</label><input name=TURNSTILE_SECRET_KEY value='{html_escape(v['TURNSTILE_SECRET_KEY'])}'></div><div><label>欢迎按钮</label><input name=RELAY_WELCOME_BUTTONS value='{html_escape(v['RELAY_WELCOME_BUTTONS'])}' placeholder='按钮1 - https://example.com'></div></div>
+<label>欢迎消息</label><textarea name=RELAY_WELCOME_MESSAGE>{html_escape(v['RELAY_WELCOME_MESSAGE'])}</textarea>
 <div class=grid><div><label>管理员路由模式</label><select name=ADMIN_ROUTE_MODE><option value='direct' {'selected' if v['ADMIN_ROUTE_MODE'] == 'direct' else ''}>direct 直发管理员</option><option value='forum_topic' {'selected' if v['ADMIN_ROUTE_MODE'] == 'forum_topic' else ''}>forum_topic 私有超级群 Topic</option></select></div><div><label>管理员 ADMIN_CHAT_ID</label><input name=ADMIN_CHAT_ID value='{html_escape(v['ADMIN_CHAT_ID'])}'></div></div>
 <label>ADMIN_FORUM_GROUP_ID（私有超级群 ID）</label><input name=ADMIN_FORUM_GROUP_ID value='{html_escape(v['ADMIN_FORUM_GROUP_ID'])}'>
 <h3>TG 用户会话（可选）</h3><p class=muted>仅用于 TG 群监听来源=用户会话。修改后需重启。</p>
@@ -4087,7 +4593,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         return layout("用户管理", body)
 
     @app.post("/users/settings", response_class=HTMLResponse)
-    async def users_settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), RELAY_BOT_TOKEN: str = Form(""), MONITOR_BOT_TOKEN: str = Form(""), GROUP_BOT_TOKEN: str = Form(""), MONITOR_READ_COMMAND: str = Form("/r"), ADMIN_CHAT_ID: str = Form(""), ADMIN_ROUTE_MODE: str = Form("direct"), ADMIN_FORUM_GROUP_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin")) -> str:
+    async def users_settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), RELAY_BOT_TOKEN: str = Form(""), MONITOR_BOT_TOKEN: str = Form(""), GROUP_BOT_TOKEN: str = Form(""), MONITOR_READ_COMMAND: str = Form("/r"), RELAY_VERIFY_MODE: str = Form("off"), RELAY_VERIFY_TIMEOUT_SECONDS: str = Form(""), PUBLIC_BASE_URL: str = Form(""), TURNSTILE_SITE_KEY: str = Form(""), TURNSTILE_SECRET_KEY: str = Form(""), RELAY_WELCOME_MESSAGE: str = Form(DEFAULT_RELAY_WELCOME_MESSAGE), RELAY_WELCOME_BUTTONS: str = Form(""), ADMIN_CHAT_ID: str = Form(""), ADMIN_ROUTE_MODE: str = Form("direct"), ADMIN_FORUM_GROUP_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin")) -> str:
         cleanup = (cfg_load_fresh().get("cleanup") or {})
         save_panel_settings(
             locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED},

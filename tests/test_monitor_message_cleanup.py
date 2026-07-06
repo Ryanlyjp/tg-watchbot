@@ -81,6 +81,7 @@ class FakeBot:
         self.sent_texts: list[str] = []
         self.sent_chat_ids: list[int] = []
         self.sent_message_threads: list[int | None] = []
+        self.sent_reply_markups: list[object | None] = []
         self.sent_photos: list[tuple[int, str, str | None]] = []
         self.sent_documents: list[tuple[int, str, str | None]] = []
         self.sent_videos: list[tuple[int, str, str | None]] = []
@@ -104,12 +105,14 @@ class FakeBot:
         disable_web_page_preview: bool = False,
         message_thread_id=None,
         entities=None,
+        reply_markup=None,
     ):
         if chat_id in self.fail_chat_ids:
             raise RuntimeError("send failed")
         self.sent_chat_ids.append(chat_id)
         self.sent_texts.append(text)
         self.sent_message_threads.append(message_thread_id)
+        self.sent_reply_markups.append(reply_markup)
         return SimpleNamespace(message_id=3003)
 
     async def send_photo(
@@ -598,7 +601,7 @@ class MonitorMessageCleanupTest(unittest.TestCase):
                 self.answers: list[str] = []
                 self.copy_calls: list[tuple[int, int | None, int | None]] = []
 
-            async def answer(self, text: str):
+            async def answer(self, text: str, **kwargs):
                 self.answers.append(text)
 
             async def copy_to(self, chat_id: int, reply_to_message_id=None, message_thread_id=None):
@@ -609,9 +612,15 @@ class MonitorMessageCleanupTest(unittest.TestCase):
         try:
             asyncio.run(app.user_message(message))
             self.assertEqual([(-1001234567890, "Alice @alice | 2001")], fake_bot.created_topics)
-            self.assertEqual([-1001234567890], fake_bot.sent_chat_ids)
-            self.assertEqual(["#1 Alice\n<code>2001</code> · @alice\n\n你好，我想咨询"], fake_bot.sent_texts)
-            self.assertEqual([777], fake_bot.sent_message_threads)
+            self.assertEqual([2001, -1001234567890], fake_bot.sent_chat_ids)
+            self.assertEqual(
+                [
+                    "已连接客服/管理员。你发来的消息会转交给管理员，请直接输入内容。",
+                    "#1 Alice\n<code>2001</code> · @alice\n\n你好，我想咨询",
+                ],
+                fake_bot.sent_texts,
+            )
+            self.assertEqual([None, 777], fake_bot.sent_message_threads)
             self.assertEqual([], message.copy_calls)
             topic = app.get_forum_topic_by_user(2001)
             self.assertIsNotNone(topic)
@@ -654,7 +663,7 @@ class MonitorMessageCleanupTest(unittest.TestCase):
                 self.answers: list[str] = []
                 self.copy_calls: list[tuple[int, int | None, int | None]] = []
 
-            async def answer(self, text: str):
+            async def answer(self, text: str, **kwargs):
                 self.answers.append(text)
 
             async def copy_to(self, chat_id: int, reply_to_message_id=None, message_thread_id=None):
@@ -664,15 +673,16 @@ class MonitorMessageCleanupTest(unittest.TestCase):
         message = FakePrivateMessage()
         try:
             asyncio.run(app.user_message(message))
-            self.assertEqual([-1001234567890, 1001], fake_bot.sent_chat_ids)
+            self.assertEqual([2001, -1001234567890, 1001], fake_bot.sent_chat_ids)
             self.assertEqual(
                 [
+                    "已连接客服/管理员。你发来的消息会转交给管理员，请直接输入内容。",
                     "#1 Alice\n<code>2001</code> · @alice\n\n你好，我想咨询",
                     "#1 Alice\n<code>2001</code> · @alice\n\n你好，我想咨询",
                 ],
                 fake_bot.sent_texts,
             )
-            self.assertEqual([777, None], fake_bot.sent_message_threads)
+            self.assertEqual([None, 777, None], fake_bot.sent_message_threads)
             self.assertEqual([], message.copy_calls)
             self.assertEqual(2001, app.lookup_reply_target(1001, 3003))
             self.assertEqual([], message.answers)
@@ -710,7 +720,7 @@ class MonitorMessageCleanupTest(unittest.TestCase):
                 self.answers: list[str] = []
                 self.copy_calls: list[tuple[int, int | None, int | None]] = []
 
-            async def answer(self, text: str):
+            async def answer(self, text: str, **kwargs):
                 self.answers.append(text)
 
             async def copy_to(self, chat_id: int, reply_to_message_id=None, message_thread_id=None):
@@ -771,6 +781,162 @@ class MonitorMessageCleanupTest(unittest.TestCase):
                 os.environ.pop("ADMIN_FORUM_GROUP_ID", None)
             else:
                 os.environ["ADMIN_FORUM_GROUP_ID"] = old_group
+
+    def test_parse_welcome_buttons_supports_relaygo_style_rows(self) -> None:
+        rows = app.parse_welcome_buttons("官网 - https://example.com | 文档 - https://docs.example.com, 群组 - https://t.me/example")
+        self.assertEqual(
+            [
+                [
+                    {"text": "官网", "url": "https://example.com"},
+                    {"text": "文档", "url": "https://docs.example.com"},
+                ],
+                [
+                    {"text": "群组", "url": "https://t.me/example"},
+                ],
+            ],
+            rows,
+        )
+
+    def test_user_message_math_verification_prompts_then_marks_verified(self) -> None:
+        old_bot = app.bot
+        old_config = app.config
+        old_admin_chat_ids = app.admin_chat_ids
+        old_mode = os.environ.get("RELAY_VERIFY_MODE")
+        fake_bot = FakeBot()
+        app.bot = fake_bot
+        app.admin_chat_ids = [1001]
+        app.config = {"bot": {"spam_filter": {"enabled": False}, "rate_limit": {"window_seconds": 10, "max_messages": 99}}}
+        os.environ["RELAY_VERIFY_MODE"] = "math"
+
+        class FakePrivateMessage:
+            def __init__(self, text: str) -> None:
+                self.chat = SimpleNamespace(id=2001, type="private")
+                self.from_user = SimpleNamespace(id=2001, first_name="Alice", last_name="", username="alice")
+                self.text = text
+                self.caption = None
+                self.message_id = 5001
+                self.content_type = "text"
+                self.answers: list[str] = []
+
+            async def answer(self, text: str, **kwargs):
+                self.answers.append(text)
+
+            async def copy_to(self, chat_id: int, reply_to_message_id=None, message_thread_id=None):
+                return SimpleNamespace(message_id=6006)
+
+        try:
+            first = FakePrivateMessage("你好")
+            asyncio.run(app.user_message(first))
+            state = app.get_relay_user_state(2001)
+            self.assertIsNotNone(state)
+            self.assertEqual("math", state["verify_mode"])
+            self.assertEqual([], fake_bot.sent_texts)
+            self.assertEqual(1, len(first.answers))
+            answer = str(state["verify_answer"])
+
+            second = FakePrivateMessage(answer)
+            asyncio.run(app.user_message(second))
+            state = app.get_relay_user_state(2001)
+            self.assertEqual(1, state["verified"])
+            self.assertIn("✅ 验证通过，可以开始发送消息了。", fake_bot.sent_texts[-1])
+            self.assertIn("已连接客服/管理员。", fake_bot.sent_texts[-1])
+        finally:
+            app.bot = old_bot
+            app.config = old_config
+            app.admin_chat_ids = old_admin_chat_ids
+            if old_mode is None:
+                os.environ.pop("RELAY_VERIFY_MODE", None)
+            else:
+                os.environ["RELAY_VERIFY_MODE"] = old_mode
+
+    def test_existing_history_user_bypasses_verification(self) -> None:
+        old_bot = app.bot
+        old_config = app.config
+        old_admin_chat_ids = app.admin_chat_ids
+        old_mode = os.environ.get("RELAY_VERIFY_MODE")
+        fake_bot = FakeBot()
+        app.bot = fake_bot
+        app.admin_chat_ids = [1001]
+        app.config = {"bot": {"spam_filter": {"enabled": False}, "rate_limit": {"window_seconds": 10, "max_messages": 99}}}
+        os.environ["RELAY_VERIFY_MODE"] = "sticker"
+        app.upsert_user(2001, "Alice", "alice")
+        app.create_outbox_message(2001, "历史消息", "test")
+
+        class FakePrivateMessage:
+            def __init__(self) -> None:
+                self.chat = SimpleNamespace(id=2001, type="private")
+                self.from_user = SimpleNamespace(id=2001, first_name="Alice", last_name="", username="alice")
+                self.text = "继续聊"
+                self.caption = None
+                self.message_id = 5001
+                self.content_type = "text"
+                self.answers: list[str] = []
+
+            async def answer(self, text: str, **kwargs):
+                self.answers.append(text)
+
+            async def copy_to(self, chat_id: int, reply_to_message_id=None, message_thread_id=None):
+                return SimpleNamespace(message_id=6006)
+
+        try:
+            message = FakePrivateMessage()
+            asyncio.run(app.user_message(message))
+            state = app.get_relay_user_state(2001)
+            self.assertEqual(1, state["verified"])
+            self.assertEqual(["已连接客服/管理员。你发来的消息会转交给管理员，请直接输入内容。"], fake_bot.sent_texts[:1])
+            self.assertIn("#2 Alice\n<code>2001</code> · @alice\n\n继续聊", fake_bot.sent_texts[-1])
+        finally:
+            app.bot = old_bot
+            app.config = old_config
+            app.admin_chat_ids = old_admin_chat_ids
+            if old_mode is None:
+                os.environ.pop("RELAY_VERIFY_MODE", None)
+            else:
+                os.environ["RELAY_VERIFY_MODE"] = old_mode
+
+    def test_turnstile_verification_message_contains_public_verify_link(self) -> None:
+        old_mode = os.environ.get("RELAY_VERIFY_MODE")
+        old_base = os.environ.get("PUBLIC_BASE_URL")
+        old_bot = app.bot
+        fake_bot = FakeBot()
+        app.bot = fake_bot
+        os.environ["RELAY_VERIFY_MODE"] = "turnstile"
+        os.environ["PUBLIC_BASE_URL"] = "https://bot.example.com"
+
+        class FakePrivateMessage:
+            def __init__(self) -> None:
+                self.chat = SimpleNamespace(id=2001, type="private")
+                self.from_user = SimpleNamespace(id=2001, first_name="Alice", last_name="", username="alice")
+                self.text = "/start"
+                self.caption = None
+                self.message_id = 5001
+                self.content_type = "text"
+                self.answers: list[str] = []
+                self.answer_kwargs: list[dict[str, object]] = []
+
+            async def answer(self, text: str, **kwargs):
+                self.answers.append(text)
+                self.answer_kwargs.append(kwargs)
+
+        try:
+            message = FakePrivateMessage()
+            asyncio.run(app.start(message))
+            state = app.get_relay_user_state(2001)
+            self.assertEqual("turnstile", state["verify_mode"])
+            self.assertEqual(1, len(message.answers))
+            markup = message.answer_kwargs[0]["reply_markup"]
+            url = markup["inline_keyboard"][0][0]["url"]
+            self.assertTrue(url.startswith("https://bot.example.com/verify/turnstile?token="))
+        finally:
+            app.bot = old_bot
+            if old_mode is None:
+                os.environ.pop("RELAY_VERIFY_MODE", None)
+            else:
+                os.environ["RELAY_VERIFY_MODE"] = old_mode
+            if old_base is None:
+                os.environ.pop("PUBLIC_BASE_URL", None)
+            else:
+                os.environ["PUBLIC_BASE_URL"] = old_base
 
 
 class BotConfigurationTest(unittest.TestCase):

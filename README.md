@@ -75,7 +75,10 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
   - `MONITOR_BOT_TOKEN`：RSS / Web 监控推送；
   - `GROUP_BOT_TOKEN`：TG 群监听命中推送；
   - 留空时会回退到共享 `TELEGRAM_BOT_TOKEN`。
+- 新增新用户防广告验证：支持 `off` / `math` / `sticker` / `turnstile` 四种模式；`turnstile` 直接复用现有 FastAPI 面板服务暴露验证页，不需要再单独起 Cloudflare Worker。
+- 支持自定义欢迎消息和欢迎按钮；新用户首次通过验证后自动发送，已建立历史会话的老用户会自动豁免验证，不会因为升级而被卡住。
 - `forum_topic` 模式下，管理员在 Topic 内回复的媒体消息会按类型重新发送到用户私聊，规避 Telegram 对群内消息直接复制的限制。
+- `forum_topic` 模式下，管理员也可以直接在用户 Topic 内打字或发媒体，不必再手动回复某一条历史消息；这部分已经做成类似 RelayGo 的“每个用户一个线程”体验。
 - 如果 `forum_topic` 模式下同时填写了 `ADMIN_CHAT_ID`，用户私聊也会镜像一份到这些管理员 chat，方便个人提醒和直接回复。
 - 支持两种管理员路由：
   - `direct`：转发到管理员私聊 / 小群，适合轻量使用；
@@ -413,6 +416,14 @@ curl http://127.0.0.1:8765/health
 | `RELAY_BOT_TOKEN` | （可选）双向机器人专用 Token；留空则继承 `TELEGRAM_BOT_TOKEN` |
 | `MONITOR_BOT_TOKEN` | （可选）监控推送专用 Token；留空则继承 `TELEGRAM_BOT_TOKEN` |
 | `GROUP_BOT_TOKEN` | （可选）TG 群监听专用 Token；留空则继承 `TELEGRAM_BOT_TOKEN` |
+| `MONITOR_READ_COMMAND` | 监控已读快捷命令，默认 `/r` |
+| `RELAY_VERIFY_MODE` | 新用户验证模式：`off` / `math` / `sticker` / `turnstile` |
+| `RELAY_VERIFY_TIMEOUT_SECONDS` | 验证超时时间；留空时本地验证默认 `180` 秒，Turnstile 默认 `600` 秒 |
+| `PUBLIC_BASE_URL` | 公网访问地址；Turnstile 按钮会跳到 `${PUBLIC_BASE_URL}/verify/turnstile` |
+| `TURNSTILE_SITE_KEY` | Cloudflare Turnstile Site Key；仅 `turnstile` 模式需要 |
+| `TURNSTILE_SECRET_KEY` | Cloudflare Turnstile Secret Key；仅 `turnstile` 模式需要 |
+| `RELAY_WELCOME_MESSAGE` | 用户欢迎消息；支持多行，会在面板保存时自动转义 |
+| `RELAY_WELCOME_BUTTONS` | 欢迎按钮；格式示例：`官网 - https://example.com \| 群组 - https://t.me/xxx, 文档 - https://docs.example.com` |
 | `ADMIN_CHAT_ID` | `direct` 模式下的管理员 Telegram 数字 chat id；最多 3 个，用逗号分隔 |
 | `ADMIN_ROUTE_MODE` | 管理员路由模式：`direct` 或 `forum_topic` |
 | `ADMIN_FORUM_GROUP_ID` | `forum_topic` 模式下的私有超级群 ID，Bot 需要在群里且已开启 Topics |
@@ -426,6 +437,13 @@ curl http://127.0.0.1:8765/health
 | `TG_API_ID` | （可选）Telegram API ID，用于“TG 群监听=用户会话” |
 | `TG_API_HASH` | （可选）Telegram API Hash，用于“TG 群监听=用户会话” |
 | `TG_API_SESSION` | （可选）Telethon StringSession，用于“TG 群监听=用户会话” |
+
+如果要启用 `turnstile`：
+
+1. 在 Cloudflare Turnstile 创建一个站点，拿到 `Site Key` 和 `Secret Key`。
+2. 给 `tg-watchbot` 配一个公网入口，例如 Nginx 反代、Cloudflare Tunnel，或你自己的域名反向代理。
+3. 把这个公网根地址填到 `PUBLIC_BASE_URL`，例如 `https://bot.example.com`。
+4. 验证页会自动挂在 `https://bot.example.com/verify/turnstile`，不需要额外部署第二套服务。
 
 ### `config.yaml`
 
