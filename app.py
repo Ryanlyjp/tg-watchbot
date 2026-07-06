@@ -17,6 +17,7 @@ import os
 import re
 import secrets
 import signal
+import shutil
 import subprocess
 import sqlite3
 import time
@@ -26,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import quote_plus, urljoin
+from urllib.parse import quote_plus, urljoin, urlparse
 
 import feedparser
 import httpx
@@ -171,6 +172,7 @@ DEFAULT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 tg-watchbot/1.0"
 )
+DEFAULT_CURL_FALLBACK_HOSTS = ("linux.do",)
 
 logger = logging.getLogger("tg-watchbot")
 router = Router()
@@ -2642,8 +2644,78 @@ def item_blocked(item: MonitorItem, monitor: dict[str, Any]) -> tuple[bool, str]
     return False, ""
 
 
-async def fetch_url(client: httpx.AsyncClient, url: str) -> str:
+def curl_fallback_hosts(cfg: dict[str, Any] | None = None) -> list[str]:
+    http_cfg = ((cfg or config).get("http") or {}) if isinstance((cfg or config), dict) else {}
+    raw_hosts = http_cfg.get("curl_fallback_hosts")
+    hosts: list[str] = []
+    if isinstance(raw_hosts, str):
+        hosts = [part.strip().lower() for part in re.split(r"[\s,]+", raw_hosts) if part.strip()]
+    elif isinstance(raw_hosts, list):
+        hosts = [str(part).strip().lower() for part in raw_hosts if str(part).strip()]
+    return hosts or list(DEFAULT_CURL_FALLBACK_HOSTS)
+
+
+def url_uses_curl_fallback(url: str, cfg: dict[str, Any] | None = None) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(host == item or host.endswith(f".{item}") for item in curl_fallback_hosts(cfg))
+
+
+def is_cloudflare_challenge(response: Any) -> bool:
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if status_code not in {403, 429, 503}:
+        return False
+    headers = getattr(response, "headers", {}) or {}
+    text = str(getattr(response, "text", "") or "").lower()
+    server = str(headers.get("server", "")).lower()
+    return (
+        "just a moment" in text
+        or "cf-browser-verification" in text
+        or "cf-chl" in text
+        or server == "cloudflare"
+        or "cf-ray" in headers
+    )
+
+
+async def fetch_url_via_curl(url: str, timeout: int, user_agent: str, accept_header: str) -> str:
+    curl_path = shutil.which("curl")
+    if not curl_path:
+        raise RuntimeError("curl is required for this monitor fallback but was not found in PATH")
+    proc = await asyncio.create_subprocess_exec(
+        curl_path,
+        "--silent",
+        "--show-error",
+        "--location",
+        "--fail",
+        "--compressed",
+        "--max-time",
+        str(timeout),
+        "--user-agent",
+        user_agent,
+        "--header",
+        f"Accept: {accept_header}",
+        url,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        message = (stderr or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError(message or f"curl exited with code {proc.returncode}")
+    return (stdout or b"").decode("utf-8", errors="replace")
+
+
+async def fetch_url(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    timeout: int = 20,
+    user_agent: str = DEFAULT_UA,
+    accept_header: str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+) -> str:
     resp = await client.get(url, follow_redirects=True)
+    if url_uses_curl_fallback(url) and is_cloudflare_challenge(resp):
+        logger.info("fetch_url using curl fallback for %s after Cloudflare challenge", url)
+        return await fetch_url_via_curl(url, timeout, user_agent, accept_header)
     resp.raise_for_status()
     return resp.text
 
@@ -2943,7 +3015,7 @@ async def run_monitor(monitor: dict[str, Any]) -> int:
     sent_count = 0
     try:
         async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-            body = await fetch_url(client, url)
+            body = await fetch_url(client, url, timeout=timeout, user_agent=ua, accept_header=headers["Accept"])
         items = parse_rss_items(monitor, body) if mtype == "rss" else parse_web_items(monitor, body)
         for item in items:
             blocked, block_reason = item_blocked(item, monitor)
@@ -4255,7 +4327,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         headers = {"User-Agent": ua}
         try:
             async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-                body = await fetch_url(client, m.get("url"))
+                body = await fetch_url(client, m.get("url"), timeout=timeout, user_agent=ua)
             items = parse_rss_items(m, body) if m.get("type") == "rss" else parse_web_items(m, body)
             rows=[]
             for it in items[:15]:

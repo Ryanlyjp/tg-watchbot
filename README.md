@@ -117,6 +117,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 支持屏蔽词、作者、分类过滤（YAML 高级配置）。
 - 单个监控可关闭 Telegram 推送，只记录到 Web 推送历史。
 - 默认最低监控间隔为 60 秒。
+- 对 `linux.do` 这类会拦截 Python HTTP 客户端的站点，检测到 Cloudflare 挑战页后会自动回退到 `curl` 抓取；默认已包含 `linux.do`，也可通过 `http.curl_fallback_hosts` 自定义。
 
 ![示例图片](https://pic.gongyichuren.de/file/1779287170665_17b7c8b4040d6334ea62a108d08db644.png)
 
@@ -560,6 +561,16 @@ monitors:
     notify_telegram: true
     forum: true
 ```
+
+如果某些论坛前面挂了 Cloudflare，普通 `httpx/requests` 会拿到 `403 Just a moment...`。这时可以把域名加入 `http.curl_fallback_hosts`，程序会自动改用系统 `curl` 抓取：
+
+```yaml
+http:
+  curl_fallback_hosts:
+    - linux.do
+```
+
+Docker 镜像已内置 `curl`；主机直接运行 `python app.py` 时，需要系统里可执行 `curl`。
 
 网页示例：
 

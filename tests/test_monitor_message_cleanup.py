@@ -1613,5 +1613,78 @@ class ForwarderConfigTest(unittest.TestCase):
         self.assertEqual("http://127.0.0.1:9804", status["rss_url"])
 
 
+class MonitorFetchFallbackTest(unittest.TestCase):
+    def test_fetch_url_returns_httpx_body_without_challenge(self) -> None:
+        class DummyResponse:
+            status_code = 200
+            text = "<rss>ok</rss>"
+            headers = {"content-type": "application/rss+xml"}
+
+            def raise_for_status(self) -> None:
+                return None
+
+        class DummyClient:
+            async def get(self, url: str, follow_redirects: bool = True):
+                return DummyResponse()
+
+        body = asyncio.run(app.fetch_url(DummyClient(), "https://example.com/feed.xml"))
+        self.assertEqual("<rss>ok</rss>", body)
+
+    def test_fetch_url_uses_curl_for_linuxdo_cloudflare_challenge(self) -> None:
+        class DummyHTTPStatusError(Exception):
+            pass
+
+        class DummyResponse:
+            status_code = 403
+            text = "<html><title>Just a moment...</title></html>"
+            headers = {"server": "cloudflare", "cf-ray": "test"}
+
+            def raise_for_status(self) -> None:
+                raise DummyHTTPStatusError("403")
+
+        class DummyClient:
+            async def get(self, url: str, follow_redirects: bool = True):
+                return DummyResponse()
+
+        class DummyProcess:
+            def __init__(self) -> None:
+                self.returncode = 0
+
+            async def communicate(self):
+                return (b"<rss>via curl</rss>", b"")
+
+        old_which = app.shutil.which
+        old_subproc = app.asyncio.create_subprocess_exec
+        old_config = app.config
+        captured: list[tuple[object, ...]] = []
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            captured.append(args)
+            return DummyProcess()
+
+        app.shutil.which = lambda name: "/usr/bin/curl" if name == "curl" else None
+        app.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+        app.config = {"http": {"curl_fallback_hosts": ["linux.do"]}}
+        try:
+            body = asyncio.run(
+                app.fetch_url(
+                    DummyClient(),
+                    "https://linux.do/latest.rss",
+                    timeout=20,
+                    user_agent="UA-Test",
+                    accept_header="application/rss+xml",
+                )
+            )
+        finally:
+            app.shutil.which = old_which
+            app.asyncio.create_subprocess_exec = old_subproc
+            app.config = old_config
+
+        self.assertEqual("<rss>via curl</rss>", body)
+        self.assertTrue(captured)
+        self.assertIn("/usr/bin/curl", captured[0])
+        self.assertIn("https://linux.do/latest.rss", captured[0])
+
+
 if __name__ == "__main__":
     unittest.main()

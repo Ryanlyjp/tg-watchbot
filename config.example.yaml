@@ -2,6 +2,8 @@ http:
   timeout_seconds: 20
   user_agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko)
     Chrome/124.0 Safari/537.36 tg-watchbot/1.0
+  curl_fallback_hosts:
+  - linux.do
 bot:
   rate_limit:
     window_seconds: 10
