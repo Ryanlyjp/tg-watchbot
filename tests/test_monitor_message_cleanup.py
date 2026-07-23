@@ -938,6 +938,20 @@ class MonitorMessageCleanupTest(unittest.TestCase):
             else:
                 os.environ["PUBLIC_BASE_URL"] = old_base
 
+    def test_multiple_turnstile_users_can_be_marked_verified(self) -> None:
+        app.save_relay_user_state(2001, verify_mode="turnstile", verify_token="token-one")
+        app.mark_relay_user_verified(2001)
+        app.save_relay_user_state(2002, verify_mode="turnstile", verify_token="token-two")
+
+        app.mark_relay_user_verified(2002)
+
+        first = app.get_relay_user_state(2001)
+        second = app.get_relay_user_state(2002)
+        self.assertEqual(1, first["verified"])
+        self.assertEqual(1, second["verified"])
+        self.assertIsNone(first["verify_token"])
+        self.assertIsNone(second["verify_token"])
+
 
 class BotConfigurationTest(unittest.TestCase):
     def test_parse_admin_chat_ids_keeps_unique_first_three(self) -> None:
@@ -1134,6 +1148,7 @@ class PanelHtmlContractTest(unittest.TestCase):
             "name=url",
             "name=interval_seconds",
             "name=keywords",
+            "name=exclude_keywords",
             "name=item_selector",
             "name=title_selector",
             "name=link_selector",
@@ -1618,6 +1633,7 @@ class MonitorFetchFallbackTest(unittest.TestCase):
         class DummyResponse:
             status_code = 200
             text = "<rss>ok</rss>"
+            content = b"<rss>ok</rss>"
             headers = {"content-type": "application/rss+xml"}
 
             def raise_for_status(self) -> None:
@@ -1628,7 +1644,7 @@ class MonitorFetchFallbackTest(unittest.TestCase):
                 return DummyResponse()
 
         body = asyncio.run(app.fetch_url(DummyClient(), "https://example.com/feed.xml"))
-        self.assertEqual("<rss>ok</rss>", body)
+        self.assertEqual(b"<rss>ok</rss>", body)
 
     def test_fetch_url_uses_curl_for_linuxdo_cloudflare_challenge(self) -> None:
         class DummyHTTPStatusError(Exception):
@@ -1680,7 +1696,7 @@ class MonitorFetchFallbackTest(unittest.TestCase):
             app.asyncio.create_subprocess_exec = old_subproc
             app.config = old_config
 
-        self.assertEqual("<rss>via curl</rss>", body)
+        self.assertEqual(b"<rss>via curl</rss>", body)
         self.assertTrue(captured)
         self.assertIn("/usr/bin/curl", captured[0])
         self.assertIn("https://linux.do/latest.rss", captured[0])

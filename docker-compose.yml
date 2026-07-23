@@ -1,18 +1,32 @@
 services:
   tg-watchbot:
-    build: .
+    build:
+      context: .
+      args:
+        APP_UID: ${TG_WATCHBOT_UID:-999}
+        APP_GID: ${TG_WATCHBOT_GID:-994}
     container_name: tg-watchbot
     restart: unless-stopped
     ports:
-      - "8765:8765"
-    env_file:
-      - .env
-    environment:
-      WEB_PANEL_HOST: 0.0.0.0
+      - "127.0.0.1:8765:8765"
     volumes:
-      - ./config.yaml:/app/config.yaml
-      - ./tg-watchbot.sqlite3:/app/tg-watchbot.sqlite3
-      - ./tg-watchbot.log:/app/tg-watchbot.log
+      - ./docker-data:/data
+      - ./forwarder:/data/forwarder
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=67108864
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    init: true
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
   telegram-forwarder:
     image: heavrnl/telegramforwarder:latest
     container_name: telegram-forwarder

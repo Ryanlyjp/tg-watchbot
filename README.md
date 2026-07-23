@@ -114,7 +114,8 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
   - 库存变化。
 - 支持论坛 RSS 增强字段：作者、分类、tags、摘要。
 - 支持去重，避免同一条反复推送。
-- 支持屏蔽词、作者、分类过滤（YAML 高级配置）。
+- 支持在监控编辑页填写屏蔽关键词；标题或正文命中任意屏蔽词时不推送，匹配不区分大小写。
+- 被屏蔽条目仍会写入去重状态，之后移除屏蔽词也不会补推旧帖；作者、分类过滤仍可通过 YAML 高级配置使用。
 - 单个监控可关闭 Telegram 推送，只记录到 Web 推送历史。
 - 默认最低监控间隔为 60 秒。
 - 对 `linux.do` 这类会拦截 Python HTTP 客户端的站点，检测到 Cloudflare 挑战页后会自动回退到 `curl` 抓取；默认已包含 `linux.do`，也可通过 `http.curl_fallback_hosts` 自定义。
@@ -125,7 +126,8 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 
 - 登录页 + HttpOnly session cookie，不使用丑陋的浏览器 Basic Auth。
 - 监控列表、新增、编辑、删除、手动检查、预览。
-- NodeSeek / Linux.do RSS 模板。
+- 内置 NodeSeek、Linux.do、NodeLoc、DeepFlood、大佬论坛、V2EX、小众软件、恩山无线论坛、SegmentFault、CNode、Ruby China、Obsidian 中文论坛、FreeMdict、吾爱破解和 HostLoc 论坛模板。
+- 新论坛模板支持首次运行仅建立基线，避免把订阅源里的历史帖子一次性全部推送；可单独停用暂时无法访问的目标。
 - 批量新增监控。
 - YAML 高级编辑。
 - Bot Token / 管理员 ID / 面板账号配置页。
@@ -175,13 +177,16 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 ```bash
 git clone https://github.com/GongyiChuren/tg-watchbot.git tg-watchbot
 cd tg-watchbot
-cp .env.example .env
-cp config.example.yaml config.yaml
-touch tg-watchbot.sqlite3 tg-watchbot.log
+export TG_WATCHBOT_UID="$(id -u)"
+export TG_WATCHBOT_GID="$(id -g)"
+mkdir -p docker-data
+cp .env.example docker-data/.env
+cp config.example.yaml docker-data/config.yaml
+touch docker-data/tg-watchbot.sqlite3 docker-data/tg-watchbot.log
 docker compose up -d --build
 ```
 
-Docker 会在容器内监听 `0.0.0.0:8765`，宿主机仍然打开 `http://127.0.0.1:8765`。
+Docker 容器使用当前用户对应的非 root UID/GID，根文件系统只读并移除全部 Linux capabilities。运行数据保存在 `docker-data/`；宿主机端口只绑定 `127.0.0.1:8765`，可以继续通过 Cloudflare Tunnel 访问。
 
 查看状态与日志：
 

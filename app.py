@@ -55,11 +55,12 @@ except Exception:  # pragma: no cover - optional dependency
     StringSession = None
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "tg-watchbot.sqlite3"
-CONFIG_PATH = BASE_DIR / "config.yaml"
-ENV_PATH = BASE_DIR / ".env"
-LOG_PATH = BASE_DIR / "tg-watchbot.log"
-FORWARDER_DIR = BASE_DIR / "forwarder"
+DATA_DIR = Path(os.getenv("TG_WATCHBOT_DATA_DIR", str(BASE_DIR))).resolve()
+DB_PATH = DATA_DIR / "tg-watchbot.sqlite3"
+CONFIG_PATH = DATA_DIR / "config.yaml"
+ENV_PATH = DATA_DIR / ".env"
+LOG_PATH = DATA_DIR / "tg-watchbot.log"
+FORWARDER_DIR = DATA_DIR / "forwarder"
 FORWARDER_ENV_PATH = FORWARDER_DIR / ".env"
 FORWARDER_ENV_EXAMPLE_PATH = FORWARDER_DIR / ".env.example"
 FORWARDER_RSS_HOST_PORT = 9804
@@ -173,6 +174,99 @@ DEFAULT_UA = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 tg-watchbot/1.0"
 )
 DEFAULT_CURL_FALLBACK_HOSTS = ("linux.do",)
+
+DEFAULT_FORUM_KEYWORDS = [
+    "geelinx",
+    "优惠",
+    "免费",
+    "羊毛",
+    "福利",
+    "优惠码",
+    "esim",
+    "team",
+    "注册",
+    "注册机",
+    "claude",
+    "codex",
+    "gpt",
+    "开源",
+    "VPS",
+    "NAT",
+    "API",
+    "补货",
+    "免费鸡",
+    "公益",
+    "焚诀",
+    "焚决",
+]
+
+
+def rss_forum_template(name: str, url: str, interval_seconds: int = 180) -> dict[str, Any]:
+    return {
+        "name": name,
+        "type": "rss",
+        "url": url,
+        "interval_seconds": interval_seconds,
+        "keywords": list(DEFAULT_FORUM_KEYWORDS),
+        "exclude_keywords": [],
+        "enabled": True,
+        "baseline_on_first_run": True,
+        "notify_telegram": True,
+        "forum": True,
+        "notify_on": {
+            "keyword_match": True,
+            "new_item": True,
+            "price_change": False,
+            "stock_change": False,
+        },
+    }
+
+
+def forum_monitor_templates() -> dict[str, dict[str, Any]]:
+    templates = {
+        "nodeseek": rss_forum_template("NodeSeek 新帖", "https://rss.nodeseek.com/", 60),
+        "linuxdo": rss_forum_template("Linux.do 最新", "https://linux.do/latest.rss", 60),
+        "linuxdo-resource": rss_forum_template("Linux.do 资源荟萃", "https://linux.do/c/resource/14.rss", 60),
+        "nodeloc": rss_forum_template("NodeLoc 最新", "https://www.nodeloc.com/latest.rss", 120),
+        "deepflood": rss_forum_template("DeepFlood 最新", "https://www.deepflood.com/rss.xml", 300),
+        "dalao": rss_forum_template("大佬论坛最新", "https://www.dalao.net/feed.htm", 180),
+        "v2ex": rss_forum_template("V2EX 最新", "https://www.v2ex.com/index.xml", 120),
+        "appinn": rss_forum_template("小众软件论坛最新", "https://meta.appinn.net/latest.rss", 180),
+        "right": rss_forum_template("恩山无线论坛最新", "https://www.right.com.cn/forum/forum.php?mod=rss", 300),
+        "segmentfault": rss_forum_template("SegmentFault 最新问题", "https://segmentfault.com/feeds", 180),
+        "cnode": rss_forum_template("CNode 最新", "https://cnodejs.org/rss", 180),
+        "ruby-china": rss_forum_template("Ruby China 最新", "https://ruby-china.org/topics/feed", 300),
+        "obsidian-cn": rss_forum_template("Obsidian 中文论坛最新", "https://forum-zh.obsidian.md/latest.rss", 300),
+        "freemdict": rss_forum_template("FreeMdict 最新", "https://forum.freemdict.com/latest.rss", 300),
+        "52pojie": rss_forum_template(
+            "吾爱破解最新",
+            "https://www.52pojie.cn/forum.php?mod=guide&view=newthread&rss=1",
+            300,
+        ),
+    }
+    templates["hostloc"] = {
+        "name": "HostLoc 最新",
+        "type": "web",
+        "url": "https://hostloc.com/forum.php?mod=guide&view=newthread",
+        "interval_seconds": 300,
+        "keywords": list(DEFAULT_FORUM_KEYWORDS),
+        "exclude_keywords": [],
+        "enabled": False,
+        "baseline_on_first_run": True,
+        "notify_telegram": True,
+        "selectors": {
+            "item": 'tbody[id^="normalthread_"]',
+            "title": "a.xst",
+            "link": "a.xst",
+        },
+        "notify_on": {
+            "keyword_match": True,
+            "new_item": True,
+            "price_change": False,
+            "stock_change": False,
+        },
+    }
+    return templates
 
 logger = logging.getLogger("tg-watchbot")
 router = Router()
@@ -481,7 +575,7 @@ def save_relay_user_state(user_id: int, **fields: Any) -> None:
         "verified": 0,
         "verify_mode": "",
         "verify_answer": "",
-        "verify_token": "",
+        "verify_token": None,
         "verify_expires_at": None,
         "verified_at": None,
         "welcome_sent_at": None,
@@ -520,7 +614,7 @@ def save_relay_user_state(user_id: int, **fields: Any) -> None:
                 int(values["verified"] or 0),
                 values["verify_mode"] or "",
                 values["verify_answer"] or "",
-                values["verify_token"] or "",
+                values["verify_token"] or None,
                 values["verify_expires_at"],
                 values["verified_at"],
                 values["welcome_sent_at"],
@@ -2631,7 +2725,7 @@ def keyword_hits(text: str, keywords: list[str]) -> list[str]:
 
 
 def item_blocked(item: MonitorItem, monitor: dict[str, Any]) -> tuple[bool, str]:
-    text = f"{item.title} {item.text} {item.author or ''} {item.category or ''}"
+    text = f"{item.title} {item.text}"
     exclude_hits = keyword_hits(text, monitor.get("exclude_keywords") or [])
     if exclude_hits:
         return True, "屏蔽词 " + ", ".join(exclude_hits)
@@ -2676,7 +2770,7 @@ def is_cloudflare_challenge(response: Any) -> bool:
     )
 
 
-async def fetch_url_via_curl(url: str, timeout: int, user_agent: str, accept_header: str) -> str:
+async def fetch_url_via_curl(url: str, timeout: int, user_agent: str, accept_header: str) -> bytes:
     curl_path = shutil.which("curl")
     if not curl_path:
         raise RuntimeError("curl is required for this monitor fallback but was not found in PATH")
@@ -2701,7 +2795,7 @@ async def fetch_url_via_curl(url: str, timeout: int, user_agent: str, accept_hea
     if proc.returncode != 0:
         message = (stderr or b"").decode("utf-8", errors="replace").strip()
         raise RuntimeError(message or f"curl exited with code {proc.returncode}")
-    return (stdout or b"").decode("utf-8", errors="replace")
+    return stdout or b""
 
 
 async def fetch_url(
@@ -2711,16 +2805,33 @@ async def fetch_url(
     timeout: int = 20,
     user_agent: str = DEFAULT_UA,
     accept_header: str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-) -> str:
+) -> bytes:
     resp = await client.get(url, follow_redirects=True)
     if url_uses_curl_fallback(url) and is_cloudflare_challenge(resp):
         logger.info("fetch_url using curl fallback for %s after Cloudflare challenge", url)
         return await fetch_url_via_curl(url, timeout, user_agent, accept_header)
     resp.raise_for_status()
-    return resp.text
+    return resp.content
 
 
-def parse_web_items(monitor: dict[str, Any], body: str) -> list[MonitorItem]:
+def blocked_page_reason(body: str | bytes) -> str | None:
+    if isinstance(body, bytes):
+        sample = body[:20000].decode("utf-8", errors="ignore")
+    else:
+        sample = body[:20000]
+    low = sample.lower()
+    if "just a moment" in low or "enable javascript and cookies to continue" in low:
+        return "Cloudflare browser challenge"
+    if "休息下，一会见" in sample:
+        return "站点返回访问频率限制页"
+    if "cf-browser-verification" in low or "cf-chl" in low:
+        return "Cloudflare verification page"
+    return None
+
+
+def parse_web_items(monitor: dict[str, Any], body: str | bytes) -> list[MonitorItem]:
+    if reason := blocked_page_reason(body):
+        raise ValueError(reason)
     selectors = monitor.get("selectors") or {}
     item_sel = selectors.get("item") or "article, .thread, .post, li"
     title_sel = selectors.get("title") or "h1, h2, h3, a"
@@ -2762,8 +2873,12 @@ def canonical_forum_key(link: str, entry_id: str = "") -> str:
     target = link or entry_id
     patterns = [
         r"nodeseek\.com/post-(\d+)",
+        r"deepflood\.com/post-(\d+)",
         r"linux\.do/t/(?:[^/]+/)?(\d+)",
         r"/t/(?:[^/]+/)?(\d+)",
+        r"/thread-(\d+)-",
+        r"[?&]tid=(\d+)",
+        r"/topics/(\d+)",
     ]
     for value in [target, entry_id, link]:
         for pattern in patterns:
@@ -2773,7 +2888,9 @@ def canonical_forum_key(link: str, entry_id: str = "") -> str:
     return stable_key(link or entry_id)
 
 
-def parse_rss_items(monitor: dict[str, Any], body: str) -> list[MonitorItem]:
+def parse_rss_items(monitor: dict[str, Any], body: str | bytes) -> list[MonitorItem]:
+    if reason := blocked_page_reason(body):
+        raise ValueError(reason)
     feed = feedparser.parse(body)
     items: list[MonitorItem] = []
     for e in feed.entries[:100]:
@@ -2789,8 +2906,20 @@ def parse_rss_items(monitor: dict[str, Any], body: str) -> list[MonitorItem]:
             category = ", ".join([t.get("term", "") for t in tags if isinstance(t, dict) and t.get("term")])
         entry_id = getattr(e, "id", "") or getattr(e, "guid", "")
         key = canonical_forum_key(link, entry_id) if (monitor.get("forum") or monitor.get("type") == "rss") else stable_key(entry_id, link, title)
-        items.append(MonitorItem(key=key, title=title, link=link, text=f"{title} {summary} {content} {published} {author} {category}", author=author, published=published, category=category))
+        items.append(MonitorItem(key=key, title=title, link=link, text=f"{title} {summary} {content}", author=author, published=published, category=category))
+    if not items:
+        detail = str(getattr(feed, "bozo_exception", "") or "").strip()
+        raise ValueError(f"RSS/Atom 未解析到任何条目{': ' + detail if detail else ''}")
     return items
+
+
+def monitor_has_state(monitor_name: str) -> bool:
+    with closing(db()) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM monitor_state WHERE monitor_name=? LIMIT 1",
+            (monitor_name,),
+        ).fetchone()
+    return row is not None
 
 
 def should_notify_and_update(monitor: dict[str, Any], item: MonitorItem, hits: list[str]) -> list[str]:
@@ -3017,9 +3146,11 @@ async def run_monitor(monitor: dict[str, Any]) -> int:
         async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
             body = await fetch_url(client, url, timeout=timeout, user_agent=ua, accept_header=headers["Accept"])
         items = parse_rss_items(monitor, body) if mtype == "rss" else parse_web_items(monitor, body)
+        baseline_only = bool(monitor.get("baseline_on_first_run", False)) and not monitor_has_state(name)
         for item in items:
             blocked, block_reason = item_blocked(item, monitor)
             if blocked:
+                should_notify_and_update(monitor, item, [])
                 logger.debug("monitor %s skipped item %s: %s", name, item.title, block_reason)
                 continue
             hits = keyword_hits(f"{item.title} {item.text}", keywords)
@@ -3029,6 +3160,8 @@ async def run_monitor(monitor: dict[str, Any]) -> int:
                 should_notify_and_update(monitor, item, [])  # still remember state to avoid later old flood
                 continue
             reasons = should_notify_and_update(monitor, item, hits)
+            if baseline_only:
+                continue
             if not reasons:
                 continue
             # 论坛/RSS 以帖子本身作为事件键；不要把“命中原因/检查时间/编辑变化”放进去，避免同一帖重复发。
@@ -3064,6 +3197,8 @@ async def run_monitor(monitor: dict[str, Any]) -> int:
                 continue
             if await admin_send_monitor(text, name):
                 sent_count += 1
+        if baseline_only:
+            logger.info("monitor %s initialized baseline with %d items", name, len(items))
         record_monitor_runtime(name, ok=True, duration_ms=int((time.time() - started) * 1000), sent_count=sent_count)
     except Exception as e:
         logger.exception("monitor failed: %s %s", name, url)
@@ -3170,6 +3305,8 @@ async def run_all_monitors_once() -> None:
     logger.info("manual/all monitor run start, count=%d", len(monitors))
     total = 0
     for m in monitors:
+        if not bool(m.get("enabled", True)):
+            continue
         total += await run_monitor(m)
     logger.info("manual/all monitor run done, notifications=%d", total)
 
@@ -3177,6 +3314,9 @@ async def run_all_monitors_once() -> None:
 def schedule_monitors(scheduler: AsyncIOScheduler) -> None:
     for idx, m in enumerate(config.get("monitors") or []):
         name = m.get("name", "unnamed")
+        if not bool(m.get("enabled", True)):
+            logger.info("monitor %s is disabled; scheduler skipped", name)
+            continue
         requested = int(m.get("interval_seconds", MIN_INTERVAL_SECONDS))
         interval = max(requested, MIN_INTERVAL_SECONDS)
         if requested < MIN_INTERVAL_SECONDS:
@@ -3466,6 +3606,12 @@ def cfg_save(new_cfg: dict[str, Any]) -> None:
             raise ValueError("每个 monitor 必须是对象")
         if int(m.get("interval_seconds", MIN_INTERVAL_SECONDS)) < MIN_INTERVAL_SECONDS:
             m["interval_seconds"] = MIN_INTERVAL_SECONDS
+        raw_excludes = m.get("exclude_keywords") or []
+        if isinstance(raw_excludes, str):
+            raw_excludes = [part.strip() for part in re.split(r"[\r\n,]+", raw_excludes) if part.strip()]
+        if not isinstance(raw_excludes, list):
+            raise ValueError("monitor.exclude_keywords 必须是列表或文本")
+        m["exclude_keywords"] = [str(part).strip() for part in raw_excludes if str(part).strip()]
     group_monitor_rows = new_cfg.get("group_monitors") or []
     if group_monitor_rows is not None and not isinstance(group_monitor_rows, list):
         raise ValueError("group_monitors 必须是列表")
@@ -3605,6 +3751,7 @@ def monitor_from_form(
     url: str,
     interval_seconds: int,
     keywords: str,
+    exclude_keywords: str,
     item_selector: str,
     title_selector: str,
     link_selector: str,
@@ -3615,6 +3762,7 @@ def monitor_from_form(
     price_change: bool,
     stock_change: bool,
     notify_telegram: bool = True,
+    enabled: bool = True,
 ) -> dict[str, Any]:
     m: dict[str, Any] = {
         "name": name.strip(),
@@ -3622,6 +3770,9 @@ def monitor_from_form(
         "url": url.strip(),
         "interval_seconds": max(int(interval_seconds or MIN_INTERVAL_SECONDS), MIN_INTERVAL_SECONDS),
         "keywords": parse_lines(keywords),
+        "exclude_keywords": parse_lines(exclude_keywords),
+        "enabled": enabled,
+        "baseline_on_first_run": True,
         "notify_telegram": notify_telegram,
         "notify_on": {
             "keyword_match": keyword_match,
@@ -3743,6 +3894,7 @@ def monitor_form_html(m: dict[str, Any] | None = None, idx: int | None = None) -
     selectors = m.get("selectors") or {}
     no = m.get("notify_on") or {}
     keywords = "\n".join(m.get("keywords") or [])
+    exclude_keywords = "\n".join(m.get("exclude_keywords") or [])
     action = "/monitor/save" if idx is not None else "/monitor/create"
     hidden = f"<input type=hidden name=original_index value='{idx}'>" if idx is not None else ""
     def checked(k: str) -> str:
@@ -3753,6 +3905,7 @@ def monitor_form_html(m: dict[str, Any] | None = None, idx: int | None = None) -
 <div><label>URL</label><input name=url value='{html_escape(m.get('url',''))}' required></div>
 <div><label>间隔秒数（最低 60）</label><input name=interval_seconds type=number min=60 value='{html_escape(m.get('interval_seconds',60))}'></div></div>
 <label>关键词（一行一个）</label><textarea name=keywords>{html_escape(keywords)}</textarea>
+<label>屏蔽关键词（一行一个）</label><textarea name=exclude_keywords placeholder='标题或正文命中任意一项时不推送'>{html_escape(exclude_keywords)}</textarea>
 <h3>Web 选择器（RSS 可忽略）</h3><div class=grid>
 <div><label>条目选择器</label><input name=item_selector value='{html_escape(selectors.get('item','article, .thread, .post, li'))}'></div>
 <div><label>标题选择器</label><input name=title_selector value='{html_escape(selectors.get('title','h1, h2, h3, a'))}'></div>
@@ -3764,6 +3917,7 @@ def monitor_form_html(m: dict[str, Any] | None = None, idx: int | None = None) -
 <label><input type=checkbox name=new_item {checked('new_item')}> 新条目</label>
 <label><input type=checkbox name=price_change {checked('price_change')}> 价格变化</label>
 <label><input type=checkbox name=stock_change {checked('stock_change')}> 库存变化</label>
+<label><input type=checkbox name=enabled {'checked' if m.get('enabled', True) else ''}> 启用监控</label>
 <label><input type=checkbox name=notify_telegram {'checked' if m.get('notify_telegram', True) else ''}> 推送 Telegram</label></div>
 <div class=form-actions><button class='btn primary' type=submit>保存</button> <a class=btn href='/'>取消</a></div></form>"""
 
@@ -3940,6 +4094,7 @@ button[disabled]{{opacity:.45;cursor:not-allowed}}
         rows = []
         for i, m in enumerate(cfg.get("monitors") or []):
             tg = "TG" if m.get("notify_telegram", True) else "仅 Web"
+            enabled_label = "运行中" if m.get("enabled", True) else "已停用"
             name = str(m.get("name", ""))
             st = statuses.get(name)
             st_badge = get_monitor_status_badge(st)
@@ -3951,7 +4106,9 @@ button[disabled]{{opacity:.45;cursor:not-allowed}}
                 )
                 if st.get("last_error"):
                     st_line += f"<br><small>{html_escape(str(st.get('last_error'))[:100])}</small>"
-            rows.append(f"""<tr><td><span class=badge>{html_escape(m.get('type','web'))}</span></td><td><b>{html_escape(name)}</b><br><small>{html_escape(m.get('url',''))}</small></td><td>{html_escape(m.get('interval_seconds',60))}s<br><small>{tg}</small></td><td>{html_escape(', '.join(m.get('keywords') or []))}</td><td>{st_line}</td><td><a class=btn href='/monitor/{i}/edit'>编辑</a> <a class='btn ok' href='/monitor/{i}/preview'>预览</a> <a class='btn ok' href='/monitor/{i}/run'>检查</a> <a class='btn danger' href='/monitor/{i}/delete' onclick='return confirm("确定删除？")'>删除</a></td></tr>""")
+            include_text = html_escape(', '.join(m.get('keywords') or []) or '-')
+            exclude_text = html_escape(', '.join(m.get('exclude_keywords') or []) or '-')
+            rows.append(f"""<tr><td><span class=badge>{html_escape(m.get('type','web'))}</span></td><td><b>{html_escape(name)}</b><br><small>{html_escape(m.get('url',''))}</small></td><td>{html_escape(m.get('interval_seconds',60))}s<br><small>{enabled_label} · {tg}</small></td><td>{include_text}<br><small>屏蔽：{exclude_text}</small></td><td>{st_line}</td><td><a class=btn href='/monitor/{i}/edit'>编辑</a> <a class='btn ok' href='/monitor/{i}/preview'>预览</a> <a class='btn ok' href='/monitor/{i}/run'>检查</a> <a class='btn danger' href='/monitor/{i}/delete' onclick='return confirm("确定删除？")'>删除</a></td></tr>""")
         body = f"""<div class=card><div class=toolbar><div><h2 style='margin:0 0 6px'>监控目标</h2><p class=muted style='margin:0'>当前 {len(cfg.get('monitors') or [])} 个；保存后自动重载定时任务。</p></div><div class=actions><a class='btn' href='/monitor/templates'>论坛模板</a> <a class='btn primary' href='/monitor/new'>新增监控</a> <a class='btn ok' href='/monitor/bulk'>批量新增</a></div></div><table style='margin-top:16px'><tr><th>类型</th><th>目标</th><th>间隔/通知</th><th>关键词</th><th>运行状态</th><th>操作</th></tr>""" + "".join(rows) + "</table></div>"
         return layout("监控", body)
 
@@ -4208,17 +4365,21 @@ button[disabled]{{opacity:.45;cursor:not-allowed}}
 
     @app.get("/monitor/templates", response_class=HTMLResponse)
     async def monitor_templates(_: str = Depends(panel_auth)) -> str:
-        body = """<div class=card><h2>论坛监控模板</h2><p class=muted>NodeSeek / Linux.do 建议用 RSS，不抓网页 HTML，抗 Cloudflare 更稳。</p><div class=grid><a class='btn primary' href='/monitor/template/nodeseek'>NodeSeek 新帖</a><a class='btn primary' href='/monitor/template/linuxdo'>Linux.do 最新</a><a class='btn primary' href='/monitor/template/linuxdo-resource'>Linux.do 资源荟萃</a></div></div>"""
+        buttons = "".join(
+            f"<a class='btn primary' href='/monitor/template/{html_escape(kind)}'>{html_escape(template['name'])}</a>"
+            for kind, template in forum_monitor_templates().items()
+        )
+        body = (
+            "<div class=card><h2>论坛监控模板</h2>"
+            "<p class=muted>优先使用站点公开 RSS/Atom；新模板首次运行只建立基线，不推送历史条目。"
+            "HostLoc 默认停用，需要先预览确认当前出口没有触发限流页。</p>"
+            f"<div class=grid>{buttons}</div></div>"
+        )
         return layout("监控模板", body)
 
     @app.get("/monitor/template/{kind}", response_class=HTMLResponse)
     async def monitor_template(kind: str, _: str = Depends(panel_auth)) -> str:
-        templates = {
-            "nodeseek": {"name": "NodeSeek 新帖", "type": "rss", "url": "https://rss.nodeseek.com/", "interval_seconds": 60, "keywords": ["NAT", "优惠", "补货", "VPS", "免费"], "forum": True, "notify_on": {"keyword_match": True, "new_item": True, "price_change": False, "stock_change": False}},
-            "linuxdo": {"name": "Linux.do 最新", "type": "rss", "url": "https://linux.do/latest.rss", "interval_seconds": 60, "keywords": ["Claude", "Codex", "API", "VPS", "NAT"], "forum": True, "notify_on": {"keyword_match": True, "new_item": True, "price_change": False, "stock_change": False}},
-            "linuxdo-resource": {"name": "Linux.do 资源荟萃", "type": "rss", "url": "https://linux.do/c/resource/14.rss", "interval_seconds": 60, "keywords": ["免费", "开源", "API", "Claude"], "forum": True, "notify_on": {"keyword_match": True, "new_item": True, "price_change": False, "stock_change": False}},
-        }
-        m = templates.get(kind)
+        m = forum_monitor_templates().get(kind)
         if not m:
             raise HTTPException(404, "template not found")
         return layout("使用模板新增", "<div class=card><p class=muted>这是预设模板，保存即可加入监控；也可以先调整关键词。</p></div>" + monitor_form_html(m))
@@ -4248,7 +4409,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
             name, url = parts[0], parts[1]
             keywords = parts[2] if len(parts) >= 3 else ""
             try:
-                monitors.append(monitor_from_form(None, name, mtype, url, interval_seconds, keywords.replace(',', '\n'), "article, .thread, .post, li", "h1, h2, h3, a", "a", "", "", bool(keyword_match), bool(new_item), bool(price_change), bool(stock_change), bool(notify_telegram)))
+                monitors.append(monitor_from_form(None, name, mtype, url, interval_seconds, keywords.replace(',', '\n'), "", "article, .thread, .post, li", "h1, h2, h3, a", "a", "", "", bool(keyword_match), bool(new_item), bool(price_change), bool(stock_change), bool(notify_telegram)))
                 added += 1
             except Exception as e:
                 errors.append(f"第 {line_no} 行失败：{html_escape(e)}")
@@ -4275,6 +4436,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         url: str,
         interval_seconds: int,
         keywords: str,
+        exclude_keywords: str,
         item_selector: str,
         title_selector: str,
         link_selector: str,
@@ -4284,11 +4446,17 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         new_item: str | None,
         price_change: str | None,
         stock_change: str | None,
+        enabled: str | None,
         notify_telegram: str | None,
     ) -> RedirectResponse:
         cfg = cfg_load_fresh()
         monitors = cfg.setdefault("monitors", [])
-        m = monitor_from_form(original_index, name, mtype, url, interval_seconds, keywords, item_selector, title_selector, link_selector, price_selector, stock_selector, bool(keyword_match), bool(new_item), bool(price_change), bool(stock_change), bool(notify_telegram))
+        m = monitor_from_form(original_index, name, mtype, url, interval_seconds, keywords, exclude_keywords, item_selector, title_selector, link_selector, price_selector, stock_selector, bool(keyword_match), bool(new_item), bool(price_change), bool(stock_change), bool(notify_telegram), bool(enabled))
+        if original_index is not None and 0 <= original_index < len(monitors):
+            previous = monitors[original_index]
+            for key in ("authors", "categories"):
+                if key in previous:
+                    m[key] = previous[key]
         if original_index is None:
             monitors.append(m)
         else:
@@ -4301,12 +4469,12 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         return RedirectResponse("/", status_code=303)
 
     @app.post("/monitor/create")
-    async def create_monitor(_: str = Depends(panel_auth), name: str = Form(...), mtype: str = Form(...), url: str = Form(...), interval_seconds: int = Form(300), keywords: str = Form(""), item_selector: str = Form(""), title_selector: str = Form(""), link_selector: str = Form(""), price_selector: str = Form(""), stock_selector: str = Form(""), keyword_match: str | None = Form(None), new_item: str | None = Form(None), price_change: str | None = Form(None), stock_change: str | None = Form(None), notify_telegram: str | None = Form(None)) -> RedirectResponse:
-        return await save_form_common(None, name, mtype, url, interval_seconds, keywords, item_selector, title_selector, link_selector, price_selector, stock_selector, keyword_match, new_item, price_change, stock_change, notify_telegram)
+    async def create_monitor(_: str = Depends(panel_auth), name: str = Form(...), mtype: str = Form(...), url: str = Form(...), interval_seconds: int = Form(300), keywords: str = Form(""), exclude_keywords: str = Form(""), item_selector: str = Form(""), title_selector: str = Form(""), link_selector: str = Form(""), price_selector: str = Form(""), stock_selector: str = Form(""), keyword_match: str | None = Form(None), new_item: str | None = Form(None), price_change: str | None = Form(None), stock_change: str | None = Form(None), enabled: str | None = Form(None), notify_telegram: str | None = Form(None)) -> RedirectResponse:
+        return await save_form_common(None, name, mtype, url, interval_seconds, keywords, exclude_keywords, item_selector, title_selector, link_selector, price_selector, stock_selector, keyword_match, new_item, price_change, stock_change, enabled, notify_telegram)
 
     @app.post("/monitor/save")
-    async def save_monitor(_: str = Depends(panel_auth), original_index: int = Form(...), name: str = Form(...), mtype: str = Form(...), url: str = Form(...), interval_seconds: int = Form(300), keywords: str = Form(""), item_selector: str = Form(""), title_selector: str = Form(""), link_selector: str = Form(""), price_selector: str = Form(""), stock_selector: str = Form(""), keyword_match: str | None = Form(None), new_item: str | None = Form(None), price_change: str | None = Form(None), stock_change: str | None = Form(None), notify_telegram: str | None = Form(None)) -> RedirectResponse:
-        return await save_form_common(original_index, name, mtype, url, interval_seconds, keywords, item_selector, title_selector, link_selector, price_selector, stock_selector, keyword_match, new_item, price_change, stock_change, notify_telegram)
+    async def save_monitor(_: str = Depends(panel_auth), original_index: int = Form(...), name: str = Form(...), mtype: str = Form(...), url: str = Form(...), interval_seconds: int = Form(300), keywords: str = Form(""), exclude_keywords: str = Form(""), item_selector: str = Form(""), title_selector: str = Form(""), link_selector: str = Form(""), price_selector: str = Form(""), stock_selector: str = Form(""), keyword_match: str | None = Form(None), new_item: str | None = Form(None), price_change: str | None = Form(None), stock_change: str | None = Form(None), enabled: str | None = Form(None), notify_telegram: str | None = Form(None)) -> RedirectResponse:
+        return await save_form_common(original_index, name, mtype, url, interval_seconds, keywords, exclude_keywords, item_selector, title_selector, link_selector, price_selector, stock_selector, keyword_match, new_item, price_change, stock_change, enabled, notify_telegram)
 
     @app.get("/monitor/{idx}/delete")
     async def delete_monitor(idx: int, _: str = Depends(panel_auth)) -> RedirectResponse:
@@ -4931,7 +5099,7 @@ async def start_panel_server() -> uvicorn.Server | None:
     if not panel_enabled():
         logger.info("web panel disabled")
         return None
-    host = os.getenv("WEB_PANEL_HOST", "127.0.0.1")
+    host = os.getenv("WEB_PANEL_BIND_HOST") or os.getenv("WEB_PANEL_HOST", "127.0.0.1")
     port = int(os.getenv("WEB_PANEL_PORT", "8765"))
     server = uvicorn.Server(uvicorn.Config(create_panel_app(), host=host, port=port, log_level="info"))
     asyncio.create_task(server.serve())

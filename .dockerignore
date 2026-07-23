@@ -1,5 +1,10 @@
 .git
 .venv
+.env
+config.yaml
+docker-data
+backups
+forwarder/.env
 __pycache__
 *.pyc
 *.pyo
