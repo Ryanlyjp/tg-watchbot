@@ -27,6 +27,29 @@ services:
       options:
         max-size: 10m
         max-file: "3"
+    depends_on:
+      flaresolverr:
+        condition: service_healthy
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: tg-watchbot-flaresolverr
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: warning
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=134217728
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    init: true
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8191/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
   telegram-forwarder:
     image: heavrnl/telegramforwarder:latest
     container_name: telegram-forwarder
@@ -34,8 +57,7 @@ services:
       - forwarder
     restart: unless-stopped
     env_file:
-      - path: ./forwarder/.env
-        required: false
+      - ./forwarder/.env
     ports:
       - "9804:8000"
     volumes:

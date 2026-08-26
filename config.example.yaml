@@ -55,6 +55,42 @@ monitors:
     stock_change: false
   notify_telegram: true
   forum: true
+- name: IDCFLARE 最新
+  type: rss
+  url: https://idcflare.com/latest.rss
+  interval_seconds: 180
+  keywords:
+  - 优惠
+  - 免费
+  - VPS
+  - API
+  exclude_keywords: []
+  notify_on:
+    keyword_match: true
+    new_item: true
+    price_change: false
+    stock_change: false
+  notify_telegram: true
+  forum: true
+  baseline_on_first_run: true
+- name: 烧饼论坛最新
+  type: rss
+  url: https://sb.sb/rss.xml
+  interval_seconds: 180
+  keywords:
+  - 优惠
+  - 免费
+  - VPS
+  - API
+  exclude_keywords: []
+  notify_on:
+    keyword_match: true
+    new_item: true
+    price_change: false
+    stock_change: false
+  notify_telegram: true
+  forum: true
+  baseline_on_first_run: true
 group_monitors:
 - name: TG 群关键词监听示例
   enabled: false

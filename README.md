@@ -119,6 +119,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 单个监控可关闭 Telegram 推送，只记录到 Web 推送历史。
 - 默认最低监控间隔为 60 秒。
 - 对 `linux.do` 这类会拦截 Python HTTP 客户端的站点，检测到 Cloudflare 挑战页后会自动回退到 `curl` 抓取；默认已包含 `linux.do`，也可通过 `http.curl_fallback_hosts` 自定义。
+- `idcflare.com` 遇到 Cloudflare 浏览器挑战时，会转交给内部 FlareSolverr 浏览器服务抓取；该服务不开放宿主机端口，仅用于恢复 IDCFLARE RSS。
 
 ![示例图片](https://pic.gongyichuren.de/file/1779287170665_17b7c8b4040d6334ea62a108d08db644.png)
 
@@ -126,7 +127,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 
 - 登录页 + HttpOnly session cookie，不使用丑陋的浏览器 Basic Auth。
 - 监控列表、新增、编辑、删除、手动检查、预览。
-- 内置 NodeSeek、Linux.do、NodeLoc、DeepFlood、大佬论坛、V2EX、小众软件、恩山无线论坛、SegmentFault、CNode、Ruby China、Obsidian 中文论坛、FreeMdict、吾爱破解和 HostLoc 论坛模板。
+- 内置 NodeSeek、Linux.do、IDCFLARE、烧饼论坛、NodeLoc、DeepFlood、大佬论坛、V2EX、小众软件、恩山无线论坛、SegmentFault、CNode、Ruby China、Obsidian 中文论坛、FreeMdict、吾爱破解和 HostLoc 论坛模板。
 - 新论坛模板支持首次运行仅建立基线，避免把订阅源里的历史帖子一次性全部推送；可单独停用暂时无法访问的目标。
 - 批量新增监控。
 - YAML 高级编辑。
@@ -576,6 +577,8 @@ http:
 ```
 
 Docker 镜像已内置 `curl`；主机直接运行 `python app.py` 时，需要系统里可执行 `curl`。
+
+IDCFLARE 公开 RSS 为 `https://idcflare.com/latest.rss`。它对普通服务器请求启用了 Cloudflare 浏览器挑战，因此 Docker 部署会同时启动一个不暴露端口的 FlareSolverr 服务。程序只在 IDCFLARE 返回挑战页时才使用该服务，并会将浏览器 RSS 预览页中的 XML 还原后再解析。烧饼论坛可直接使用 `https://sb.sb/rss.xml`，无需浏览器后备。详见 [RSS 监控](docs/rss-monitoring.md)。
 
 网页示例：
 

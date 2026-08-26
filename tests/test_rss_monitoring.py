@@ -17,6 +17,24 @@ def rss_bytes(items: list[tuple[str, str, str]]) -> bytes:
 
 
 class RssParsingTest(unittest.TestCase):
+    def test_flaresolverr_rss_preview_is_unwrapped(self) -> None:
+        rendered = (
+            "<html><body><pre>&lt;?xml version='1.0'?&gt;"
+            "&lt;rss version='2.0'&gt;&lt;channel&gt;&lt;title&gt;IDCFLARE&lt;/title&gt;"
+            "&lt;/channel&gt;&lt;/rss&gt;</pre></body></html>"
+        )
+
+        body = app.unwrap_flaresolverr_rss(rendered)
+
+        self.assertTrue(body.startswith(b"<?xml"))
+        self.assertIn(b"<rss", body)
+
+    def test_idcflare_and_sb_templates_use_verified_feed_urls(self) -> None:
+        templates = app.forum_monitor_templates()
+
+        self.assertEqual("https://idcflare.com/latest.rss", templates["idcflare"]["url"])
+        self.assertEqual("https://sb.sb/rss.xml", templates["sb"]["url"])
+
     def test_exclude_keywords_match_title_and_content_only(self) -> None:
         item = app.MonitorItem(
             key="1",

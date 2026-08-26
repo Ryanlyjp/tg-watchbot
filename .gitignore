@@ -1,6 +1,7 @@
 .env
 config.yaml
 memory.md
+progress.md
 *.log
 *.sqlite3
 *.sqlite3-*

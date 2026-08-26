@@ -174,6 +174,9 @@ DEFAULT_UA = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 tg-watchbot/1.0"
 )
 DEFAULT_CURL_FALLBACK_HOSTS = ("linux.do",)
+IDCF_FLARE_HOST = "idcflare.com"
+FLARESOLVERR_URL = "http://flaresolverr:8191/v1"
+FLARESOLVERR_TIMEOUT_SECONDS = 60
 
 DEFAULT_FORUM_KEYWORDS = [
     "geelinx",
@@ -227,6 +230,8 @@ def forum_monitor_templates() -> dict[str, dict[str, Any]]:
         "nodeseek": rss_forum_template("NodeSeek 新帖", "https://rss.nodeseek.com/", 60),
         "linuxdo": rss_forum_template("Linux.do 最新", "https://linux.do/latest.rss", 60),
         "linuxdo-resource": rss_forum_template("Linux.do 资源荟萃", "https://linux.do/c/resource/14.rss", 60),
+        "idcflare": rss_forum_template("IDCFLARE 最新", "https://idcflare.com/latest.rss", 180),
+        "sb": rss_forum_template("烧饼论坛最新", "https://sb.sb/rss.xml", 180),
         "nodeloc": rss_forum_template("NodeLoc 最新", "https://www.nodeloc.com/latest.rss", 120),
         "deepflood": rss_forum_template("DeepFlood 最新", "https://www.deepflood.com/rss.xml", 300),
         "dalao": rss_forum_template("大佬论坛最新", "https://www.dalao.net/feed.htm", 180),
@@ -2754,6 +2759,11 @@ def url_uses_curl_fallback(url: str, cfg: dict[str, Any] | None = None) -> bool:
     return any(host == item or host.endswith(f".{item}") for item in curl_fallback_hosts(cfg))
 
 
+def url_uses_flaresolverr_fallback(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host == IDCF_FLARE_HOST or host.endswith(f".{IDCF_FLARE_HOST}")
+
+
 def is_cloudflare_challenge(response: Any) -> bool:
     status_code = int(getattr(response, "status_code", 0) or 0)
     if status_code not in {403, 429, 503}:
@@ -2798,6 +2808,36 @@ async def fetch_url_via_curl(url: str, timeout: int, user_agent: str, accept_hea
     return stdout or b""
 
 
+def unwrap_flaresolverr_rss(body: str) -> bytes:
+    """Extract XML from Chromium's rendered RSS preview when it uses a <pre> element."""
+    content = body.strip()
+    if content.startswith("<?xml") or content.startswith("<rss") or content.startswith("<feed"):
+        return content.encode("utf-8")
+    match = re.search(r"<pre[^>]*>(.*?)</pre>", content, re.I | re.S)
+    if match:
+        content = html.unescape(match.group(1)).strip()
+    if content.startswith("<?xml") or content.startswith("<rss") or content.startswith("<feed"):
+        return content.encode("utf-8")
+    raise RuntimeError("Flaresolverr returned a browser page instead of RSS XML")
+
+
+async def fetch_url_via_flaresolverr(url: str, accept_header: str) -> bytes:
+    payload = {
+        "cmd": "request.get",
+        "url": url,
+        "maxTimeout": FLARESOLVERR_TIMEOUT_SECONDS * 1000,
+        "headers": {"Accept": accept_header},
+    }
+    async with httpx.AsyncClient(timeout=FLARESOLVERR_TIMEOUT_SECONDS + 5) as solver_client:
+        response = await solver_client.post(FLARESOLVERR_URL, json=payload)
+    response.raise_for_status()
+    result = response.json()
+    solution = result.get("solution") or {}
+    if result.get("status") != "ok" or int(solution.get("status") or 0) != 200:
+        raise RuntimeError("Flaresolverr could not fetch the IDCFLARE RSS feed")
+    return unwrap_flaresolverr_rss(str(solution.get("response") or ""))
+
+
 async def fetch_url(
     client: httpx.AsyncClient,
     url: str,
@@ -2810,6 +2850,9 @@ async def fetch_url(
     if url_uses_curl_fallback(url) and is_cloudflare_challenge(resp):
         logger.info("fetch_url using curl fallback for %s after Cloudflare challenge", url)
         return await fetch_url_via_curl(url, timeout, user_agent, accept_header)
+    if url_uses_flaresolverr_fallback(url) and is_cloudflare_challenge(resp):
+        logger.info("fetch_url using Flaresolverr fallback for %s after Cloudflare challenge", url)
+        return await fetch_url_via_flaresolverr(url, accept_header)
     resp.raise_for_status()
     return resp.content
 
