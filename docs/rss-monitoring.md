@@ -15,6 +15,10 @@ Linux.SB does not expose a public RSS or Atom feed. Its `linuxsb` forum template
 
 It is configured as a forum monitor with `baseline_on_first_run: true`, so the current homepage items are remembered without sending historical notifications. Each `/topic/<id>` URL is used as the stable item key, preventing a title edit from being treated as a new post. The application also identifies the `linux.sb` host as a forum monitor when a panel edit has omitted its `forum` field, and matches legacy title-keyed state by topic URL during the transition.
 
+## Telegram notification content
+
+Forum notifications sent to Telegram include the title, link, and match reason. Telegram already displays the delivery time, so published and check times are omitted from the message only; monitor events and their creation time remain available in the panel. Linux.SB also omits author and category because its homepage topic list does not provide them.
+
 ## Cloudflare handling
 
 SB.SB is fetched with the ordinary RSS client. IDCFLARE returns a Cloudflare browser challenge to ordinary clients and to `curl`, so the application falls back to the internal `flaresolverr` Docker service only after detecting that challenge.

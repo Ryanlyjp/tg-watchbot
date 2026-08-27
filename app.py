@@ -2901,6 +2901,27 @@ def is_forum_monitor(monitor: dict[str, Any]) -> bool:
     return (urlparse(str(monitor.get("url") or "")).hostname or "").lower() == "linux.sb"
 
 
+def format_forum_monitor_message(monitor: dict[str, Any], item: MonitorItem, reasons: list[str]) -> str:
+    lines = [
+        f"[新帖命中] {html_escape(monitor.get('name', 'unnamed'))}",
+        f"标题：{html_escape(item.title)}",
+    ]
+    if (urlparse(str(monitor.get("url") or "")).hostname or "").lower() != "linux.sb":
+        lines.extend(
+            [
+                f"作者：{html_escape(item.author or '-')}",
+                f"分类：{html_escape(item.category or '-')}",
+            ]
+        )
+    lines.extend(
+        [
+            f"链接：{html_escape(item.link)}",
+            f"命中：{html_escape('; '.join(reasons))}",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def parse_web_items(monitor: dict[str, Any], body: str | bytes) -> list[MonitorItem]:
     if reason := blocked_page_reason(body):
         raise ValueError(reason)
@@ -3251,16 +3272,7 @@ async def run_monitor(monitor: dict[str, Any]) -> int:
                 continue
             notify_on_tg = bool(monitor.get("notify_telegram", True))
             if is_forum:
-                text = (
-                    f"[新帖命中] {html_escape(name)}\n"
-                    f"标题：{html_escape(item.title)}\n"
-                    f"作者：{html_escape(item.author or '-')}\n"
-                    f"分类：{html_escape(item.category or '-')}\n"
-                    f"链接：{html_escape(item.link)}\n"
-                    f"命中：{html_escape('; '.join(reasons))}\n"
-                    f"发布时间：{html_escape(item.published or '-')}\n"
-                    f"检查时间：{html_escape(now_iso())}"
-                )
+                text = format_forum_monitor_message(monitor, item, reasons)
             else:
                 text = (
                     f"[库存/关键词命中] {html_escape(name)}\n"

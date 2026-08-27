@@ -50,6 +50,33 @@ class RssParsingTest(unittest.TestCase):
         self.assertEqual("https://linux.sb/topic/16277", items[0].link)
         self.assertEqual("VPS 优惠", items[0].title)
 
+    def test_forum_telegram_messages_omit_redundant_fields(self) -> None:
+        item = app.MonitorItem(
+            key="1",
+            title="送网易云会员了",
+            link="https://linux.sb/topic/16808",
+            text="送网易云会员了",
+            author="作者",
+            category="福利",
+            published="2026-08-27T08:57:31+00:00",
+        )
+
+        linuxsb = app.format_forum_monitor_message(
+            {"name": "Linux.SB 最新", "url": "https://linux.sb"}, item, ["新条目", "关键词 福利"]
+        )
+        rss = app.format_forum_monitor_message(
+            {"name": "RSS 论坛", "url": "https://example.com/feed"}, item, ["新条目"]
+        )
+
+        self.assertEqual(
+            "[新帖命中] Linux.SB 最新\n标题：送网易云会员了\n链接：https://linux.sb/topic/16808\n命中：新条目; 关键词 福利",
+            linuxsb,
+        )
+        self.assertIn("作者：作者", rss)
+        self.assertIn("分类：福利", rss)
+        self.assertNotIn("发布时间", linuxsb + rss)
+        self.assertNotIn("检查时间", linuxsb + rss)
+
     def test_exclude_keywords_match_title_and_content_only(self) -> None:
         item = app.MonitorItem(
             key="1",
