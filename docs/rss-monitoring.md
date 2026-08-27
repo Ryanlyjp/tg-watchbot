@@ -15,6 +15,19 @@ SB.SB is fetched with the ordinary RSS client. IDCFLARE returns a Cloudflare bro
 
 FlareSolverr is not published on a host port. It is available only to the `tg-watchbot` container on the Docker network. Chromium renders RSS as an HTML preview with the XML inside a `pre` element; the application extracts that XML before passing it to the existing RSS parser.
 
+## DNS on pchk
+
+The `pchk` host uses `systemd-resolved` with DNS over TLS. DNSSEC validation is disabled in `/etc/systemd/resolved.conf` because several valid RSS hosts, including `linux.sb`, return an incomplete DNSSEC chain and otherwise fail to resolve from both the host and Docker containers. The configured upstream resolvers remain Cloudflare and Google.
+
+After changing that file, run `systemctl restart systemd-resolved` and verify both paths:
+
+```bash
+getent ahostsv4 linux.sb
+docker exec tg-watchbot getent ahostsv4 linux.sb
+```
+
+To roll back, restore the timestamped `/etc/systemd/resolved.conf.bak-*` backup created before the change, then restart `systemd-resolved`.
+
 ## Validation and rollback
 
 After deployment, open the monitor preview or run a manual check for each source. A successful IDCFLARE check logs `Flaresolverr fallback` and should not log `monitor failed`.
