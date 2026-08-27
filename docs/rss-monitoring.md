@@ -9,6 +9,12 @@ The forum templates include these feeds:
 
 Both templates use `baseline_on_first_run: true`, so adding them records the current feed without sending historical posts.
 
+## Linux.SB web monitoring
+
+Linux.SB does not expose a public RSS or Atom feed. Its `linuxsb` forum template polls `https://linux.sb` every 180 seconds and extracts the homepage topic cards with `.post-list .post-item` and `.post-title`.
+
+It is configured as a forum monitor with `baseline_on_first_run: true`, so the current homepage items are remembered without sending historical notifications. Each `/topic/<id>` URL is used as the stable item key, preventing a title edit from being treated as a new post.
+
 ## Cloudflare handling
 
 SB.SB is fetched with the ordinary RSS client. IDCFLARE returns a Cloudflare browser challenge to ordinary clients and to `curl`, so the application falls back to the internal `flaresolverr` Docker service only after detecting that challenge.

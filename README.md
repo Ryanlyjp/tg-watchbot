@@ -578,7 +578,7 @@ http:
 
 Docker 镜像已内置 `curl`；主机直接运行 `python app.py` 时，需要系统里可执行 `curl`。
 
-IDCFLARE 公开 RSS 为 `https://idcflare.com/latest.rss`。它对普通服务器请求启用了 Cloudflare 浏览器挑战，因此 Docker 部署会同时启动一个不暴露端口的 FlareSolverr 服务。程序只在 IDCFLARE 返回挑战页时才使用该服务，并会将浏览器 RSS 预览页中的 XML 还原后再解析。烧饼论坛可直接使用 `https://sb.sb/rss.xml`，无需浏览器后备。详见 [RSS 监控](docs/rss-monitoring.md)。
+IDCFLARE 公开 RSS 为 `https://idcflare.com/latest.rss`。它对普通服务器请求启用了 Cloudflare 浏览器挑战，因此 Docker 部署会同时启动一个不暴露端口的 FlareSolverr 服务。程序只在 IDCFLARE 返回挑战页时才使用该服务，并会将浏览器 RSS 预览页中的 XML 还原后再解析。烧饼论坛可直接使用 `https://sb.sb/rss.xml`，无需浏览器后备。Linux.SB 没有公开 RSS，内置模板通过首页帖子列表监控新帖，并在首次启用时只建立基线。详见 [RSS 监控](docs/rss-monitoring.md)。
 
 网页示例：
 

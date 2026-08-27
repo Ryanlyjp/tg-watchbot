@@ -35,6 +35,21 @@ class RssParsingTest(unittest.TestCase):
         self.assertEqual("https://idcflare.com/latest.rss", templates["idcflare"]["url"])
         self.assertEqual("https://sb.sb/rss.xml", templates["sb"]["url"])
 
+    def test_linuxsb_web_template_parses_topic_cards_with_stable_ids(self) -> None:
+        monitor = app.forum_monitor_templates()["linuxsb"]
+        body = """
+        <div class="post-list">
+          <div class="post-item"><a class="post-title" href="/topic/16277">VPS 优惠</a></div>
+          <div class="post-item"><a class="post-title" href="/topic/12948">免费 API</a></div>
+        </div>
+        """
+
+        items = app.parse_web_items(monitor, body)
+
+        self.assertEqual(["16277", "12948"], [item.key for item in items])
+        self.assertEqual("https://linux.sb/topic/16277", items[0].link)
+        self.assertEqual("VPS 优惠", items[0].title)
+
     def test_exclude_keywords_match_title_and_content_only(self) -> None:
         item = app.MonitorItem(
             key="1",

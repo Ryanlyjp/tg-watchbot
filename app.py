@@ -271,6 +271,29 @@ def forum_monitor_templates() -> dict[str, dict[str, Any]]:
             "stock_change": False,
         },
     }
+    templates["linuxsb"] = {
+        "name": "Linux.SB 最新",
+        "type": "web",
+        "url": "https://linux.sb",
+        "interval_seconds": 180,
+        "keywords": list(DEFAULT_FORUM_KEYWORDS),
+        "exclude_keywords": [],
+        "enabled": True,
+        "baseline_on_first_run": True,
+        "notify_telegram": True,
+        "forum": True,
+        "selectors": {
+            "item": ".post-list .post-item",
+            "title": ".post-title",
+            "link": ".post-title",
+        },
+        "notify_on": {
+            "keyword_match": True,
+            "new_item": True,
+            "price_change": False,
+            "stock_change": False,
+        },
+    }
     return templates
 
 logger = logging.getLogger("tg-watchbot")
@@ -2906,7 +2929,7 @@ def parse_web_items(monitor: dict[str, Any], body: str | bytes) -> list[MonitorI
                 stock = hint
                 break
         if title or text:
-            key = stable_key(link, title or text[:80])
+            key = canonical_forum_key(link) if monitor.get("forum") else stable_key(link, title or text[:80])
             items.append(MonitorItem(key=key, title=title or "(no title)", link=link, text=text, price=price, stock=stock))
     return items
 
@@ -2919,6 +2942,7 @@ def canonical_forum_key(link: str, entry_id: str = "") -> str:
         r"deepflood\.com/post-(\d+)",
         r"linux\.do/t/(?:[^/]+/)?(\d+)",
         r"/t/(?:[^/]+/)?(\d+)",
+        r"/topic/(\d+)",
         r"/thread-(\d+)-",
         r"[?&]tid=(\d+)",
         r"/topics/(\d+)",

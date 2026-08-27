@@ -91,6 +91,28 @@ monitors:
   notify_telegram: true
   forum: true
   baseline_on_first_run: true
+- name: Linux.SB 最新
+  type: web
+  url: https://linux.sb
+  interval_seconds: 180
+  keywords:
+  - 优惠
+  - 免费
+  - VPS
+  - API
+  exclude_keywords: []
+  notify_on:
+    keyword_match: true
+    new_item: true
+    price_change: false
+    stock_change: false
+  notify_telegram: true
+  forum: true
+  baseline_on_first_run: true
+  selectors:
+    item: .post-list .post-item
+    title: .post-title
+    link: .post-title
 group_monitors:
 - name: TG 群关键词监听示例
   enabled: false
