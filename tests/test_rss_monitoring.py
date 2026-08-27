@@ -151,6 +151,40 @@ class MonitorBaselineTest(unittest.TestCase):
         self.assertEqual(0, send.await_count)
         self.assertTrue(app.monitor_has_state("过滤测试"))
 
+    def test_linuxsb_does_not_repeat_keyword_matches_without_forum_flag(self) -> None:
+        monitor = app.forum_monitor_templates()["linuxsb"]
+        monitor.pop("forum")
+        monitor["baseline_on_first_run"] = False
+        body = '<div class="post-list"><div class="post-item"><a class="post-title" href="/topic/16797">免费住宅 IP</a></div></div>'
+
+        with patch.object(app, "fetch_url", new=AsyncMock(side_effect=[body, body])), patch.object(
+            app, "admin_send_monitor", new=AsyncMock(return_value=True)
+        ) as send:
+            self.assertEqual(1, asyncio.run(app.run_monitor(monitor)))
+            self.assertEqual(0, asyncio.run(app.run_monitor(monitor)))
+
+        self.assertEqual(1, send.await_count)
+
+    def test_linuxsb_matches_legacy_state_by_topic_url(self) -> None:
+        monitor = app.forum_monitor_templates()["linuxsb"]
+        monitor.pop("forum")
+        monitor["baseline_on_first_run"] = False
+        link = "https://linux.sb/topic/16797"
+        with app.closing(app.db()) as conn:
+            conn.execute(
+                "INSERT INTO monitor_state(monitor_name, item_key, price, stock, title, link, updated_at) VALUES(?,?,?,?,?,?,?)",
+                (monitor["name"], app.stable_key(link, "原标题"), None, None, "原标题", link, app.now_iso()),
+            )
+            conn.commit()
+        body = '<div class="post-list"><div class="post-item"><a class="post-title" href="/topic/16797">免费住宅 IP 更新标题</a></div></div>'
+
+        with patch.object(app, "fetch_url", new=AsyncMock(return_value=body)), patch.object(
+            app, "admin_send_monitor", new=AsyncMock(return_value=True)
+        ) as send:
+            self.assertEqual(0, asyncio.run(app.run_monitor(monitor)))
+
+        self.assertEqual(0, send.await_count)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2895,6 +2895,12 @@ def blocked_page_reason(body: str | bytes) -> str | None:
     return None
 
 
+def is_forum_monitor(monitor: dict[str, Any]) -> bool:
+    if monitor.get("type") == "rss" or monitor.get("forum"):
+        return True
+    return (urlparse(str(monitor.get("url") or "")).hostname or "").lower() == "linux.sb"
+
+
 def parse_web_items(monitor: dict[str, Any], body: str | bytes) -> list[MonitorItem]:
     if reason := blocked_page_reason(body):
         raise ValueError(reason)
@@ -2929,7 +2935,7 @@ def parse_web_items(monitor: dict[str, Any], body: str | bytes) -> list[MonitorI
                 stock = hint
                 break
         if title or text:
-            key = canonical_forum_key(link) if monitor.get("forum") else stable_key(link, title or text[:80])
+            key = canonical_forum_key(link) if is_forum_monitor(monitor) else stable_key(link, title or text[:80])
             items.append(MonitorItem(key=key, title=title or "(no title)", link=link, text=text, price=price, stock=stock))
     return items
 
@@ -2994,11 +3000,18 @@ def should_notify_and_update(monitor: dict[str, Any], item: MonitorItem, hits: l
     notify_on = monitor.get("notify_on") or {}
     reasons: list[str] = []
     with closing(db()) as conn:
+        is_forum = is_forum_monitor(monitor)
         prev = conn.execute(
             "SELECT * FROM monitor_state WHERE monitor_name=? AND item_key=?",
             (name, item.key),
         ).fetchone()
-        is_forum = bool(monitor.get("forum") or monitor.get("type") == "rss")
+        # Linux.SB originally used title-based keys. Match its existing records by
+        # URL once so the switch to topic IDs does not resend them as new posts.
+        if prev is None and is_forum and monitor.get("type") == "web" and item.link:
+            prev = conn.execute(
+                "SELECT * FROM monitor_state WHERE monitor_name=? AND link=?",
+                (name, item.link),
+            ).fetchone()
         if is_forum:
             # 论坛/RSS 帖子只在首次出现并命中时通知一次。
             # 后续 RSS 因回复/编辑把同一链接重新排到前面时，只更新状态，不再重复推送。
@@ -3232,7 +3245,7 @@ async def run_monitor(monitor: dict[str, Any]) -> int:
             if not reasons:
                 continue
             # 论坛/RSS 以帖子本身作为事件键；不要把“命中原因/检查时间/编辑变化”放进去，避免同一帖重复发。
-            is_forum = monitor.get("forum") or mtype == "rss"
+            is_forum = is_forum_monitor(monitor)
             event_key = stable_key(name, item.key) if is_forum else stable_key(name, item.key, "|".join(reasons), item.price or "", item.stock or "")
             if not event_not_sent(event_key, name, item.title, item.link):
                 continue
@@ -4521,7 +4534,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         m = monitor_from_form(original_index, name, mtype, url, interval_seconds, keywords, exclude_keywords, item_selector, title_selector, link_selector, price_selector, stock_selector, bool(keyword_match), bool(new_item), bool(price_change), bool(stock_change), bool(notify_telegram), bool(enabled))
         if original_index is not None and 0 <= original_index < len(monitors):
             previous = monitors[original_index]
-            for key in ("authors", "categories"):
+            for key in ("authors", "categories", "forum"):
                 if key in previous:
                     m[key] = previous[key]
         if original_index is None:

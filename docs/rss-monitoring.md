@@ -13,7 +13,7 @@ Both templates use `baseline_on_first_run: true`, so adding them records the cur
 
 Linux.SB does not expose a public RSS or Atom feed. Its `linuxsb` forum template polls `https://linux.sb` every 180 seconds and extracts the homepage topic cards with `.post-list .post-item` and `.post-title`.
 
-It is configured as a forum monitor with `baseline_on_first_run: true`, so the current homepage items are remembered without sending historical notifications. Each `/topic/<id>` URL is used as the stable item key, preventing a title edit from being treated as a new post.
+It is configured as a forum monitor with `baseline_on_first_run: true`, so the current homepage items are remembered without sending historical notifications. Each `/topic/<id>` URL is used as the stable item key, preventing a title edit from being treated as a new post. The application also identifies the `linux.sb` host as a forum monitor when a panel edit has omitted its `forum` field, and matches legacy title-keyed state by topic URL during the transition.
 
 ## Cloudflare handling
 
