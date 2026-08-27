@@ -9,3 +9,5 @@ python-multipart==0.0.20
 PyYAML==6.0.3
 uvicorn[standard]==0.38.0
 telethon==1.42.0
+qrcode[pil]==8.2
+pysocks>=1.7.1

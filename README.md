@@ -20,8 +20,9 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 管理员可以直接回复、主动发文字/图片、并通过“回复用户消息”回传文字、图片、文件、视频等常见媒体；
 - 后台定时监控 RSS 或网页，命中关键词、新条目、价格/库存变化后推送给管理员；
 - 支持把双向机器人、监控推送、群监听拆成 3 个独立 Bot，也支持共用同一个 Bot Token；
+- 用户会话支持面板二维码登录、登录状态、登出和 `TG_PROXY`，无需手工生成 StringSession；
 - 支持把 [TelegramForwarder](https://github.com/Heavrnl/TelegramForwarder) 作为可选子服务接入，保留其完整转发能力；
-- 自带一个 Web 管理面板，可配置监控目标、编辑 YAML、查看收件箱和日志。
+- 自带明暗主题 Web 管理面板，可配置监控目标、编辑 YAML、查看收件箱和日志。
 
 项目为单文件应用，适合个人服务器、NAT 小鸡、轻量 VPS 直接用 systemd 跑。
 <a id="ai-one-line-install"></a>
@@ -31,6 +32,12 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 请克隆 `https://github.com/GongyiChuren/tg-watchbot.git` 到本机，默认使用 Docker 按 README 的 `Docker 安装（含自启）` 启动服务；若无 Docker，则按 `快速开始` 走 Python 和 systemd 部署直接安装。启动后打开 `http://127.0.0.1:8765`，安装完成后先填写管理员路由：`direct` 模式填写 `ADMIN_CHAT_ID`，或 `forum_topic` 模式填写 `ADMIN_FORUM_GROUP_ID`；然后二选一：只填共享 `TELEGRAM_BOT_TOKEN`，或分别填写 `RELAY_BOT_TOKEN` / `MONITOR_BOT_TOKEN` / `GROUP_BOT_TOKEN`；保存后执行重启（Docker 用 `docker compose restart`，直接安装用重启进程）。
 ``` 
 ## 更新日志
+
+### 2026-08-27 更新
+
+- 参考上游实现加入 TG 用户会话二维码登录、登录状态与登出，会话继续保存到持久化 `.env`，不新增数据库表。
+- 加入 `TG_PROXY`，同时作用于二维码登录和长期用户会话群监听，支持 SOCKS5、SOCKS4 和 HTTP 代理。
+- 登录页与主面板加入明暗主题切换，浏览器会保留主题偏好。
 
 ### 2026-05-22 更新
 
@@ -443,7 +450,8 @@ curl http://127.0.0.1:8765/health
 | `WEB_PANEL_SESSION_SECRET` | Session Secret，留空会自动生成并写回 `.env` |
 | `TG_API_ID` | （可选）Telegram API ID，用于“TG 群监听=用户会话” |
 | `TG_API_HASH` | （可选）Telegram API Hash，用于“TG 群监听=用户会话” |
-| `TG_API_SESSION` | （可选）Telethon StringSession，用于“TG 群监听=用户会话” |
+| `TG_API_SESSION` | （可选）Telethon StringSession；可手填，也可由面板二维码登录自动生成 |
+| `TG_PROXY` | （可选）Telethon 代理；支持 `socks5://`、`socks4://`、`http://`，可包含用户名和密码 |
 
 如果要启用 `turnstile`：
 
@@ -514,7 +522,9 @@ group_monitors:
 - `ai_min_interval_seconds`：同一个群监听最小推送间隔（防刷屏）
 - `ai_dedupe_window_seconds`：相同内容摘要去重窗口（防重复）
 - 机器人想收到群里普通消息，需要在 `@BotFather` 执行 `/setprivacy` 关闭隐私模式。
-- 若使用 `listen_source=user_session`，需在设置页填写 `TG_API_ID`、`TG_API_HASH`、`TG_API_SESSION` 后重启。
+- 若使用 `listen_source=user_session`，先在设置页填写并保存 `TG_API_ID`、`TG_API_HASH`，再点“二维码登录”扫码；状态显示“已配置，重启后连接”后重启服务。也可以继续手工填写 `TG_API_SESSION`。
+- 服务器直连 Telegram 受限时填写 `TG_PROXY`，例如 `socks5://127.0.0.1:1080` 或 `http://127.0.0.1:7890`。二维码登录和重启后的用户会话监听会使用同一代理。
+- 详细操作、状态含义和安全注意事项见 [Telegram 用户会话](docs/telegram-user-session.md)。
 
 更新代码（`/update`）已支持安全检查：
 - 显示本地/远端 commit、ahead/behind、工作区是否干净

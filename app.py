@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import html
+import io
 import logging
 import os
 import re
@@ -27,10 +29,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import quote_plus, urljoin, urlparse
+from urllib.parse import quote_plus, unquote, urljoin, urlparse
 
 import feedparser
 import httpx
+import qrcode
+import socks
 import yaml
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
@@ -312,6 +316,7 @@ pending_sendpic: dict[str, dict[str, Any]] = {}
 scheduler_ref: AsyncIOScheduler | None = None
 user_session_listener_task: asyncio.Task | None = None
 user_session_client: Any = None
+telegram_qr_logins: dict[str, dict[str, Any]] = {}
 GROUP_SUMMARY_MAX_CHARS = 800
 
 
@@ -1430,6 +1435,132 @@ def user_session_ready() -> bool:
     return True
 
 
+def _build_telethon_proxy(proxy: str) -> Any:
+    value = proxy.strip()
+    if not value:
+        return None
+    parsed = urlparse(value)
+    scheme = parsed.scheme.lower()
+    proxy_types = {
+        "socks5": socks.SOCKS5,
+        "socks4": socks.SOCKS4,
+        "http": socks.HTTP,
+    }
+    if scheme not in proxy_types:
+        raise ValueError("TG_PROXY 仅支持 socks5://、socks4:// 或 http://")
+    if not parsed.hostname:
+        raise ValueError("TG_PROXY 缺少主机名")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("TG_PROXY 端口无效") from exc
+    if not port:
+        port = 8080 if scheme == "http" else 1080
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise ValueError("TG_PROXY 不能包含路径、查询参数或片段")
+    return (
+        proxy_types[scheme],
+        parsed.hostname,
+        port,
+        True,
+        unquote(parsed.username) if parsed.username else None,
+        unquote(parsed.password) if parsed.password else None,
+    )
+
+
+async def telegram_login_prepare_qr(proxy: str = "") -> dict[str, Any]:
+    if TelegramClient is None or StringSession is None:
+        return {"ok": False, "error": "telethon 未安装"}
+    load_dotenv(ENV_PATH, override=True)
+    api_id = os.getenv("TG_API_ID", "").strip()
+    api_hash = os.getenv("TG_API_HASH", "").strip()
+    if not api_id or not api_hash:
+        return {"ok": False, "error": "请先保存 TG_API_ID 和 TG_API_HASH"}
+    try:
+        api_id_int = int(api_id)
+        proxy_arg = _build_telethon_proxy(proxy or os.getenv("TG_PROXY", ""))
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    client = TelegramClient(StringSession(), api_id_int, api_hash, proxy=proxy_arg)
+    try:
+        await client.connect()
+        qr_login = await client.qr_login()
+        qr_image = qrcode.make(qr_login.url)
+        buffer = io.BytesIO()
+        qr_image.save(buffer, format="PNG")
+        qr_b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return {
+            "ok": True,
+            "qr_png": f"data:image/png;base64,{qr_b64}",
+            "client": client,
+            "login": qr_login,
+        }
+    except Exception as exc:
+        try:
+            await client.disconnect()
+        except Exception:
+            logger.exception("telegram QR client disconnect failed")
+        return {"ok": False, "error": str(exc)}
+
+
+async def telegram_login_complete(client: Any, login: Any) -> dict[str, Any]:
+    try:
+        await login.wait()
+        session = client.session.save() if hasattr(client.session, "save") else ""
+        if not session:
+            raise RuntimeError("Telegram 未返回可保存的登录会话")
+        me = await client.get_me()
+        values = env_values()
+        values["TG_API_SESSION"] = session
+        write_env_values(values)
+        return {
+            "ok": True,
+            "username": str(getattr(me, "username", "") or ""),
+            "phone": str(getattr(me, "phone", "") or ""),
+            "user_id": str(getattr(me, "id", "") or ""),
+        }
+    finally:
+        await client.disconnect()
+
+
+async def clear_telegram_qr_logins() -> None:
+    items = list(telegram_qr_logins.values())
+    telegram_qr_logins.clear()
+    for item in items:
+        task = item.get("task")
+        if task is not None and not task.done():
+            task.cancel()
+        client = item.get("client")
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                logger.exception("telegram QR client cleanup failed")
+
+
+def telegram_login_status() -> str:
+    if user_session_client is not None:
+        try:
+            if user_session_client.is_connected():
+                return "已连接"
+        except Exception:
+            pass
+    return "已配置，重启后连接" if user_session_ready() else "未登录"
+
+
+async def telegram_logout() -> None:
+    global user_session_client
+    await clear_telegram_qr_logins()
+    if user_session_client is not None:
+        try:
+            await user_session_client.disconnect()
+        finally:
+            user_session_client = None
+    values = env_values()
+    values["TG_API_SESSION"] = ""
+    write_env_values(values)
+
+
 def group_message_text(message: Message) -> str:
     parts = [message.text or "", message.caption or ""]
     if getattr(message, "reply_to_message", None):
@@ -1758,7 +1889,12 @@ async def run_user_session_group_listener() -> None:
         logger.warning("user-session group listener skipped: TG_API_ID must be integer")
         return
     try:
-        client = TelegramClient(StringSession(session), api_id, api_hash)
+        try:
+            proxy = _build_telethon_proxy(os.getenv("TG_PROXY", ""))
+        except ValueError as exc:
+            logger.warning("user-session group listener skipped: %s", exc)
+            return
+        client = TelegramClient(StringSession(session), api_id, api_hash, proxy=proxy)
         user_session_client = client
 
         @client.on(events.NewMessage(incoming=True))  # type: ignore[misc]
@@ -3454,13 +3590,50 @@ def panel_auth(request: Request) -> str:
     return os.getenv("WEB_PANEL_USER", "admin")
 
 
+def theme_boot_script() -> str:
+    return """<script>
+(function(){
+  try {
+    var saved = localStorage.getItem('tg_watchbot_theme');
+    document.documentElement.dataset.theme = saved === 'dark' ? 'dark' : 'light';
+  } catch (e) {
+    document.documentElement.dataset.theme = 'light';
+  }
+})();
+</script>"""
+
+
+def theme_interaction_script() -> str:
+    return """<script>
+(function(){
+  function syncThemeButtons() {
+    var dark = document.documentElement.dataset.theme === 'dark';
+    document.querySelectorAll('[data-theme-toggle]').forEach(function(btn) {
+      btn.textContent = dark ? '亮' : '暗';
+      btn.title = dark ? '切换到明亮主题' : '切换到暗黑主题';
+      btn.setAttribute('aria-label', btn.title);
+    });
+  }
+  window.toggleTheme = function() {
+    var next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem('tg_watchbot_theme', next); } catch (e) {}
+    syncThemeButtons();
+  };
+  syncThemeButtons();
+})();
+</script>"""
+
+
 def login_page(error: str = "") -> str:
     err = f"<div class='login-error'>{html_escape(error)}</div>" if error else ""
     return f"""<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>
 <title>登录 · tg-watchbot</title>
 <link rel=icon href="{app_icon_data_uri()}">
+{theme_boot_script()}
 <style>
 :root{{color-scheme:light;--canvas:#f0f0f0;--ink:#121212;--muted:#5c5c5c;--red:#d02020;--blue:#1040c0;--yellow:#f0c020;--white:#fff;--ease:cubic-bezier(.2,.8,.2,1)}}
+html[data-theme='dark']{{color-scheme:dark;--canvas:#0d0f12;--ink:#f3f4f6;--muted:#a1a7b0;--red:#ff6363;--blue:#7487ff;--yellow:#e3ca67;--white:#171a20}}
 *{{box-sizing:border-box}}
 body{{margin:0;min-height:100vh;font-family:Outfit,Aptos,'Segoe UI',sans-serif;background:var(--canvas);color:var(--ink);display:grid;place-items:center;padding:24px;overflow:hidden}}
 body:before{{content:"";position:fixed;inset:auto auto -90px -70px;width:220px;height:220px;border:4px solid var(--ink);border-radius:50%;background:var(--yellow);z-index:-1;animation:floatA 5.5s var(--ease) infinite alternate}}
@@ -3480,15 +3653,19 @@ input:focus{{transform:translate(-1px,-1px);box-shadow:4px 4px 0 var(--blue)}}
 button{{width:100%;margin-top:22px;border:3px solid var(--ink);border-radius:0;padding:12px 16px;background:var(--red);color:white;font-weight:900;font-size:14px;text-transform:uppercase;letter-spacing:.08em;cursor:pointer;box-shadow:4px 4px 0 var(--ink);transition:transform .16s var(--ease),background-color .16s var(--ease);will-change:transform}}
 button:hover{{transform:translate(-1px,-1px);background:#bc1c1c}}
 button:active{{transform:translate(2px,2px)}}
+.theme-toggle{{position:fixed;right:20px;top:20px;width:40px;height:40px;margin:0;padding:0;border-radius:8px;background:var(--white);color:var(--ink);z-index:2}}
 .login-error{{background:#fff;border:3px solid var(--ink);color:var(--red);padding:10px 12px;margin-bottom:16px;font-weight:800;box-shadow:4px 4px 0 var(--red)}}
 .foot{{margin-top:18px;color:var(--muted);font-size:13px;text-align:center;font-weight:700}}
+html[data-theme='dark'] input{{background:#101319}}
+html[data-theme='dark'] .login-error{{background:#171a20}}
+html[data-theme='dark'] body:before,html[data-theme='dark'] body:after{{filter:brightness(.72)}}
 @keyframes cardIn{{from{{opacity:.0;transform:translateY(8px)}}to{{opacity:1;transform:none}}}}
 @keyframes floatA{{from{{transform:translateY(0)}}to{{transform:translateY(-8px)}}}}
 @keyframes floatB{{from{{transform:rotate(12deg) translateY(0)}}to{{transform:rotate(12deg) translateY(-9px)}}}}
 @media (prefers-reduced-motion: reduce){{
   *,*::before,*::after{{animation:none!important;transition:none!important}}
 }}
-</style></head><body><main class=login-card><div class=logo><i></i></div><h1>tg-watchbot</h1><p>登录后管理 Telegram 机器人、关键词监控和提醒。</p>{err}<form method=post action=/login><label>用户名</label><input name=username autocomplete=username autofocus><label>密码</label><input name=password type=password autocomplete=current-password><button type=submit>登录面板</button></form><div class=foot>localhost panel</div></main></body></html>"""
+</style></head><body><button class=theme-toggle type=button data-theme-toggle onclick='toggleTheme()' aria-label='切换暗黑主题' title='切换暗黑主题'>暗</button><main class=login-card><div class=logo><i></i></div><h1>tg-watchbot</h1><p>登录后管理 Telegram 机器人、关键词监控和提醒。</p>{err}<form method=post action=/login><label>用户名</label><input name=username autocomplete=username autofocus><label>密码</label><input name=password type=password autocomplete=current-password><button type=submit>登录面板</button></form><div class=foot>localhost panel</div></main>{theme_interaction_script()}</body></html>"""
 
 
 def env_values() -> dict[str, str]:
@@ -3519,6 +3696,7 @@ def env_values() -> dict[str, str]:
         "TG_API_ID": os.getenv("TG_API_ID", ""),
         "TG_API_HASH": os.getenv("TG_API_HASH", ""),
         "TG_API_SESSION": os.getenv("TG_API_SESSION", ""),
+        "TG_PROXY": os.getenv("TG_PROXY", ""),
     }
 
 
@@ -3604,6 +3782,7 @@ def write_env_values(values: dict[str, str]) -> None:
         f"TG_API_ID={values.get('TG_API_ID','')}",
         f"TG_API_HASH={values.get('TG_API_HASH','')}",
         f"TG_API_SESSION={values.get('TG_API_SESSION','')}",
+        f"TG_PROXY={values.get('TG_PROXY','')}",
         "",
     ]
     ENV_PATH.write_text("\n".join(lines), encoding="utf-8")
@@ -3895,8 +4074,10 @@ def layout(title: str, body: str) -> str:
     return f"""<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>
 <title>{html_escape(title)} · tg-watchbot</title>
 <link rel=icon href="{app_icon_data_uri()}">
+{theme_boot_script()}
 <style>
-:root{{--canvas:#f0f0f0;--ink:#121212;--muted:#5c5c5c;--red:#d02020;--blue:#1040c0;--yellow:#f0c020;--white:#fff;--gray:#e0e0e0;--ease:cubic-bezier(.2,.8,.2,1)}}
+:root{{color-scheme:light;--canvas:#f0f0f0;--ink:#121212;--muted:#5c5c5c;--red:#d02020;--blue:#1040c0;--yellow:#f0c020;--white:#fff;--gray:#e0e0e0;--ease:cubic-bezier(.2,.8,.2,1)}}
+html[data-theme='dark']{{color-scheme:dark;--canvas:#0d0f12;--ink:#f3f4f6;--muted:#a1a7b0;--red:#ff6363;--blue:#7487ff;--yellow:#e3ca67;--white:#171a20;--gray:#242932}}
 *{{box-sizing:border-box}}
 body{{font-family:Outfit,Aptos,'Segoe UI',sans-serif;background:var(--canvas);color:var(--ink);margin:0;letter-spacing:0;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}}
 body:before{{content:"";position:fixed;right:-70px;top:110px;width:190px;height:190px;border:4px solid var(--ink);border-radius:50%;background:var(--yellow);z-index:-1;animation:floatA 7s var(--ease) infinite alternate}}
@@ -3927,7 +4108,9 @@ nav a:active{{transform:translate(1px,1px);box-shadow:1px 1px 0 var(--ink)}}
 .logout{{background:var(--red)!important;color:white}}
 .top{{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:20px;border-bottom:4px solid var(--ink);padding-bottom:14px}}
 .top h1{{margin:0;font-size:34px;line-height:.95;color:var(--ink);font-weight:900;text-transform:uppercase}}
+.top-actions{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}}
 .top .badge{{background:var(--blue);color:white}}
+.theme-toggle{{width:36px;height:36px;padding:0;border-radius:8px;display:inline-grid;place-items:center}}
 .btn{{background:var(--white);color:var(--ink);padding:7px 11px;border:3px solid var(--ink);border-radius:0;display:inline-block;cursor:pointer;font-weight:900;line-height:1.35;text-transform:uppercase;font-size:12px;box-shadow:3px 3px 0 var(--ink);transition:transform .14s var(--ease),box-shadow .14s var(--ease),background-color .14s var(--ease);will-change:transform}}
 .btn:hover{{text-decoration:none;transform:translate(-1px,-1px);box-shadow:5px 5px 0 var(--ink)}}
 .btn:active{{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--ink)}}
@@ -3963,6 +4146,10 @@ pre{{white-space:pre-wrap;background:#121212;color:#fff;padding:13px;border:4px 
 .friend-links{{margin-top:18px;padding-top:12px;border-top:3px solid var(--ink);display:flex;gap:8px;align-items:center;flex-wrap:wrap}}
 .friend-links b{{font-size:12px;font-weight:900;text-transform:uppercase}}
 .friend-links a{{font-weight:900}}
+html[data-theme='dark'] body:before,html[data-theme='dark'] body:after{{filter:brightness(.7)}}
+html[data-theme='dark'] nav section,html[data-theme='dark'] input,html[data-theme='dark'] select,html[data-theme='dark'] textarea,html[data-theme='dark'] table{{background:#101319}}
+html[data-theme='dark'] tr:nth-child(even) td{{background:#151920}}
+html[data-theme='dark'] pre{{background:#080a0d}}
 @keyframes mainIn{{from{{opacity:.0;transform:translateY(8px)}}to{{opacity:1;transform:none}}}}
 @keyframes floatA{{from{{transform:translateY(0)}}to{{transform:translateY(-8px)}}}}
 @keyframes floatB{{from{{transform:rotate(45deg) translateY(0)}}to{{transform:rotate(45deg) translateY(-10px)}}}}
@@ -3977,8 +4164,8 @@ pre{{white-space:pre-wrap;background:#121212;color:#fff;padding:13px;border:4px 
 @media (prefers-reduced-motion: reduce){{
   *,*::before,*::after{{animation:none!important;transition:none!important}}
 }}
-</style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><section><b>消息</b><a href='/inbox'>收件箱</a><a href='/users'>用户管理</a><a href='/send'>主动发消息</a><a href='/replies'>快捷回复</a><a href='/rules'>私聊广告拦截</a></section><section><b>监控</b><a href='/'>监控面板</a><a href='/monitor/new'>新增监控</a><a href='/group-monitors'>TG 群监听</a><a href='/monitor/events'>推送历史</a><a href='/run-once'>手动检查</a></section><section><b>配置</b><a href='/settings'>Bot / 面板设置</a><a href='/forwarder'>TG 转发器</a><a href='/yaml'>YAML 高级编辑</a><a href='/config/export'>导出配置</a></section><section><b>系统</b><a href='/update'>更新代码</a><a href='/logs'>运行日志</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启机器人</a><a class=logout href='/logout'>退出登录</a></section></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><span class=badge>WatchBot Panel</span></div>
-{body}<div class=friend-links><b>友链</b><a href='https://linux.do' target='_blank' rel='noopener noreferrer'>Linux.do</a><span>·</span><a href='https://www.nodeseek.com' target='_blank' rel='noopener noreferrer'>NodeSeek</a></div></main></div></body></html>"""
+</style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><section><b>消息</b><a href='/inbox'>收件箱</a><a href='/users'>用户管理</a><a href='/send'>主动发消息</a><a href='/replies'>快捷回复</a><a href='/rules'>私聊广告拦截</a></section><section><b>监控</b><a href='/'>监控面板</a><a href='/monitor/new'>新增监控</a><a href='/group-monitors'>TG 群监听</a><a href='/monitor/events'>推送历史</a><a href='/run-once'>手动检查</a></section><section><b>配置</b><a href='/settings'>Bot / 面板设置</a><a href='/forwarder'>TG 转发器</a><a href='/yaml'>YAML 高级编辑</a><a href='/config/export'>导出配置</a></section><section><b>系统</b><a href='/update'>更新代码</a><a href='/logs'>运行日志</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启机器人</a><a class=logout href='/logout'>退出登录</a></section></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><div class=top-actions><button class='btn theme-toggle' type=button data-theme-toggle onclick='toggleTheme()' aria-label='切换暗黑主题' title='切换暗黑主题'>暗</button><span class=badge>WatchBot Panel</span></div></div>
+{body}<div class=friend-links><b>友链</b><a href='https://linux.do' target='_blank' rel='noopener noreferrer'>Linux.do</a><span>·</span><a href='https://www.nodeseek.com' target='_blank' rel='noopener noreferrer'>NodeSeek</a></div></main></div>{theme_interaction_script()}</body></html>"""
 
 
 def monitor_form_html(m: dict[str, Any] | None = None, idx: int | None = None) -> str:
@@ -4632,6 +4819,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         cleanup = (cfg_load_fresh().get("cleanup") or {})
         bot_ready = bot_env_configured()
         status = "" if bot_ready else "<div class=msg>未完成 Bot 配置；网页可用，但至少需要一个角色 Bot Token 和管理员路由后，双向机器人 / 监控 / 群监听才会生效。direct 模式需要 ADMIN_CHAT_ID，forum_topic 模式需要 ADMIN_FORUM_GROUP_ID。</div>"
+        login_status = telegram_login_status()
         body = f"""<h2>Bot / 面板设置</h2>{status}<div class=card><form method=post>
 <label>共享 Telegram Bot Token</label><input name=TELEGRAM_BOT_TOKEN value='{html_escape(v['TELEGRAM_BOT_TOKEN'])}' placeholder='留空则仅使用下面的角色专用 Token；填写后可作为三类角色的默认回退 Token'>
 <h3>角色 Bot Token（可选覆盖）</h3><p class=muted>留空则继承上面的共享 Token。Relay=双向机器人，Monitor=监控推送，Group=群监听。</p>
@@ -4645,13 +4833,45 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
 <label>欢迎按钮</label><textarea name=RELAY_WELCOME_BUTTONS placeholder='按钮1 - https://example.com | 按钮2 - https://t.me/xxx, 按钮3 - https://docs.example.com'>{html_escape(v['RELAY_WELCOME_BUTTONS'])}</textarea>
 <div class=grid><div><label>管理员路由模式</label><select name=ADMIN_ROUTE_MODE><option value='direct' {'selected' if v['ADMIN_ROUTE_MODE'] == 'direct' else ''}>direct 直发管理员</option><option value='forum_topic' {'selected' if v['ADMIN_ROUTE_MODE'] == 'forum_topic' else ''}>forum_topic 私有超级群 Topic</option></select></div><div><label>管理员 ADMIN_CHAT_ID</label><input name=ADMIN_CHAT_ID value='{html_escape(v['ADMIN_CHAT_ID'])}' placeholder='直发模式可填最多 3 个，逗号分隔'></div></div>
 <label>ADMIN_FORUM_GROUP_ID（私有超级群 ID）</label><input name=ADMIN_FORUM_GROUP_ID value='{html_escape(v['ADMIN_FORUM_GROUP_ID'])}' placeholder='forum_topic 模式必填，例如 -1001234567890'>
-<h3>TG 用户会话（可选）</h3><p class=muted>仅用于“TG 群监听 -> 监听来源=用户会话”，适合 Bot 无法加入的群。填写后需重启。</p>
+<h3>TG 用户会话（可选）</h3><p class=muted>用于“TG 群监听 -> 监听来源=用户会话”。先保存 TG_API_ID / TG_API_HASH，再使用二维码登录；登录后重启服务即可接入监听。</p>
 <div class=grid><div><label>TG_API_ID</label><input name=TG_API_ID value='{html_escape(v['TG_API_ID'])}' placeholder='例如 12345678'></div><div><label>TG_API_HASH</label><input name=TG_API_HASH value='{html_escape(v['TG_API_HASH'])}' placeholder='32位哈希'></div></div>
-<label>TG_API_SESSION</label><textarea name=TG_API_SESSION placeholder='Telethon StringSession'>{html_escape(v['TG_API_SESSION'])}</textarea>
+<label>TG_API_SESSION（可选，二维码登录会自动生成保存）</label><textarea name=TG_API_SESSION placeholder='Telethon StringSession'>{html_escape(v['TG_API_SESSION'])}</textarea>
+<label>TG_PROXY（可选）</label><input name=TG_PROXY value='{html_escape(v['TG_PROXY'])}' placeholder='socks5://127.0.0.1:1080 或 http://127.0.0.1:7890'>
+<div class=msg id=tgLoginBox>登录状态：<b>{html_escape(login_status)}</b></div>
+<div class=actions><button class='btn ok' type=button onclick='startTgQrLogin()'>二维码登录</button><button class='btn danger' type=button onclick='logoutTgSession()'>登出会话</button></div>
+<div id=tgQrPanel class=step style='display:none'><div class=step-title><span class=step-no>QR</span><span>扫码登录 Telegram</span></div><p class=muted id=tgQrText>正在生成二维码...</p><div id=tgQrImage></div></div>
 <div class=grid><div><label>日志级别</label><input name=LOG_LEVEL value='{html_escape(v['LOG_LEVEL'])}'></div><div><label>面板监听地址</label><input name=WEB_PANEL_HOST value='{html_escape(v['WEB_PANEL_HOST'])}'></div><div><label>面板端口</label><input name=WEB_PANEL_PORT value='{html_escape(v['WEB_PANEL_PORT'])}'></div><div><label>面板用户</label><input name=WEB_PANEL_USER value='{html_escape(v['WEB_PANEL_USER'])}'></div><div><label>面板密码</label><input name=WEB_PANEL_PASSWORD value='{html_escape(v['WEB_PANEL_PASSWORD'])}'></div></div>
 <h3>监控数据自动清理</h3><p class=muted>删除过期监控通知消息，并清理 RSS/网站监控状态和去重记录；不会删除用户、收件箱、双向对话消息。</p><div class=grid><div><label>清理间隔（分钟）</label><input name=CLEANUP_INTERVAL_MINUTES type=number min=1 value='{html_escape(cleanup.get("interval_minutes", 60))}'></div><div><label>监控通知删除时间（分钟）</label><input name=CLEANUP_MESSAGE_DELETE_AFTER_MINUTES type=number min=1 value='{html_escape(cleanup.get("monitor_message_delete_after_minutes", 60))}'></div><div><label>保留监控数据（分钟）</label><input name=CLEANUP_RETENTION_MINUTES type=number min=1 value='{html_escape(cleanup.get("monitor_retention_minutes", 1440))}'></div></div>
 <div class=grid><div><label>监控通知删除模式</label><select name=CLEANUP_MESSAGE_DELETE_MODE><option value='ttl' {'selected' if cleanup.get("monitor_message_delete_mode", "ttl") == 'ttl' else ''}>发送后倒计时删除</option><option value='after_read' {'selected' if cleanup.get("monitor_message_delete_mode", "ttl") == 'after_read' else ''}>标记已读后倒计时删除</option></select></div><div><label>待清理通知队列</label><div class=form-actions><a class='btn' href='/monitor/messages'>打开队列管理</a></div></div></div>
-<input type=hidden name=WEB_PANEL_ENABLED value='true'><div class=form-actions><button class='btn primary' type=submit>保存设置</button></div><small>改 Token、管理员 ID 或端口后需要重启。</small></form></div>"""
+<input type=hidden name=WEB_PANEL_ENABLED value='true'><div class=form-actions><button class='btn primary' type=submit>保存设置</button></div><small>改 Token、管理员 ID、端口或 TG 用户会话配置后需要重启。</small></form></div>
+<script>
+async function startTgQrLogin() {{
+  const panel = document.getElementById('tgQrPanel');
+  const text = document.getElementById('tgQrText');
+  const image = document.getElementById('tgQrImage');
+  panel.style.display = 'block'; text.textContent = '正在生成二维码...'; image.innerHTML = '';
+  const response = await fetch('/api/tg-login/qr', {{method: 'POST'}});
+  const data = await response.json();
+  if (!data.ok) {{ text.textContent = '生成失败：' + (data.error || 'unknown'); return; }}
+  image.innerHTML = '<img style="width:240px;height:240px;border:4px solid var(--ink);background:#fff" src="' + data.qr_png + '" alt="Telegram 登录二维码">';
+  text.textContent = '请用 Telegram 手机端扫码确认，二维码约 60 秒后过期。';
+  pollTgLogin(data.login_id, 0);
+}}
+async function pollTgLogin(id, elapsed) {{
+  const text = document.getElementById('tgQrText');
+  if (elapsed > 120) {{ text.textContent = '二维码已过期，请重新点击登录。'; return; }}
+  const response = await fetch('/api/tg-login/status?login_id=' + encodeURIComponent(id));
+  const data = await response.json();
+  if (data.ok && data.status === 'authorized') {{ text.textContent = '登录成功，正在刷新...'; setTimeout(() => location.reload(), 800); return; }}
+  if (data.status === 'error' || data.status === 'expired' || data.status === 'missing') {{ text.textContent = data.status === 'expired' ? '二维码已过期，请重新点击登录。' : '登录失败：' + (data.error || data.status); return; }}
+  setTimeout(() => pollTgLogin(id, elapsed + 2), 2000);
+}}
+async function logoutTgSession() {{
+  if (!confirm('确定登出 TG 用户会话？')) return;
+  const response = await fetch('/api/tg-login/logout', {{method: 'POST'}});
+  if (response.ok) location.reload();
+}}
+</script>"""
         return layout("设置", body)
 
     def save_panel_settings(
@@ -4673,9 +4893,63 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         cfg_save(cfg)
 
     @app.post("/settings", response_class=HTMLResponse)
-    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), RELAY_BOT_TOKEN: str = Form(""), MONITOR_BOT_TOKEN: str = Form(""), GROUP_BOT_TOKEN: str = Form(""), MONITOR_READ_COMMAND: str = Form("/r"), RELAY_VERIFY_MODE: str = Form("off"), RELAY_VERIFY_TIMEOUT_SECONDS: str = Form(""), PUBLIC_BASE_URL: str = Form(""), TURNSTILE_SITE_KEY: str = Form(""), TURNSTILE_SECRET_KEY: str = Form(""), RELAY_WELCOME_MESSAGE: str = Form(DEFAULT_RELAY_WELCOME_MESSAGE), RELAY_WELCOME_BUTTONS: str = Form(""), ADMIN_CHAT_ID: str = Form(""), ADMIN_ROUTE_MODE: str = Form("direct"), ADMIN_FORUM_GROUP_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440), CLEANUP_MESSAGE_DELETE_MODE: str = Form("ttl")) -> str:
+    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), RELAY_BOT_TOKEN: str = Form(""), MONITOR_BOT_TOKEN: str = Form(""), GROUP_BOT_TOKEN: str = Form(""), MONITOR_READ_COMMAND: str = Form("/r"), RELAY_VERIFY_MODE: str = Form("off"), RELAY_VERIFY_TIMEOUT_SECONDS: str = Form(""), PUBLIC_BASE_URL: str = Form(""), TURNSTILE_SITE_KEY: str = Form(""), TURNSTILE_SECRET_KEY: str = Form(""), RELAY_WELCOME_MESSAGE: str = Form(DEFAULT_RELAY_WELCOME_MESSAGE), RELAY_WELCOME_BUTTONS: str = Form(""), ADMIN_CHAT_ID: str = Form(""), ADMIN_ROUTE_MODE: str = Form("direct"), ADMIN_FORUM_GROUP_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), TG_PROXY: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440), CLEANUP_MESSAGE_DELETE_MODE: str = Form("ttl")) -> str:
         save_panel_settings(locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED}, CLEANUP_INTERVAL_MINUTES, CLEANUP_MESSAGE_DELETE_AFTER_MINUTES, CLEANUP_RETENTION_MINUTES, CLEANUP_MESSAGE_DELETE_MODE)
         return layout("已保存", "<div class=msg>已保存，不会自动重启；修改 Token/管理员 ID 后请重启。</div><p><a class=btn href='/settings'>返回</a> <a class=btn href='/restart'>重启机器人</a></p>")
+
+    @app.post("/api/tg-login/qr")
+    async def api_tg_login_qr(_: str = Depends(panel_auth)) -> dict[str, Any]:
+        await clear_telegram_qr_logins()
+        result = await telegram_login_prepare_qr(proxy=os.getenv("TG_PROXY", ""))
+        if not result.get("ok"):
+            return {"ok": False, "error": result.get("error", "failed")}
+        login_id = secrets.token_urlsafe(8)
+        item: dict[str, Any] = {
+            "client": result["client"],
+            "created_at": time.time(),
+            "status": "pending",
+        }
+        telegram_qr_logins[login_id] = item
+
+        async def waiter() -> None:
+            try:
+                item["result"] = await telegram_login_complete(result["client"], result["login"])
+                item["status"] = "authorized"
+            except asyncio.CancelledError:
+                item["status"] = "expired"
+                raise
+            except Exception as exc:
+                item["status"] = "error"
+                item["error"] = str(exc)
+
+        item["task"] = asyncio.create_task(waiter())
+        return {"ok": True, "login_id": login_id, "qr_png": result["qr_png"]}
+
+    @app.get("/api/tg-login/status")
+    async def api_tg_login_status(_: str = Depends(panel_auth), login_id: str = "") -> dict[str, Any]:
+        item = telegram_qr_logins.get(login_id)
+        if not item:
+            return {"ok": False, "status": "missing"}
+        if item.get("status") == "pending" and time.time() - float(item.get("created_at", 0)) > 120:
+            item["status"] = "expired"
+            task = item.get("task")
+            if task is not None and not task.done():
+                task.cancel()
+            await item["client"].disconnect()
+        result = item.get("result", {})
+        return {
+            "ok": True,
+            "status": item.get("status", "pending"),
+            "error": item.get("error", ""),
+            "username": result.get("username", ""),
+            "phone": result.get("phone", ""),
+            "user_id": result.get("user_id", ""),
+        }
+
+    @app.post("/api/tg-login/logout")
+    async def api_tg_login_logout(_: str = Depends(panel_auth)) -> dict[str, Any]:
+        await telegram_logout()
+        return {"ok": True}
 
     @app.get("/forwarder", response_class=HTMLResponse)
     async def forwarder_page(_: str = Depends(panel_auth)) -> str:
@@ -4919,13 +5193,14 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
 <h3>TG 用户会话（可选）</h3><p class=muted>仅用于 TG 群监听来源=用户会话。修改后需重启。</p>
 <div class=grid><div><label>TG_API_ID</label><input name=TG_API_ID value='{html_escape(v['TG_API_ID'])}'></div><div><label>TG_API_HASH</label><input name=TG_API_HASH value='{html_escape(v['TG_API_HASH'])}'></div></div>
 <label>TG_API_SESSION</label><textarea name=TG_API_SESSION>{html_escape(v['TG_API_SESSION'])}</textarea>
+<label>TG_PROXY</label><input name=TG_PROXY value='{html_escape(v['TG_PROXY'])}' placeholder='socks5://127.0.0.1:1080 或 http://127.0.0.1:7890'>
 <div class=grid><div><label>日志级别</label><input name=LOG_LEVEL value='{html_escape(v['LOG_LEVEL'])}'></div><div><label>面板监听地址</label><input name=WEB_PANEL_HOST value='{html_escape(v['WEB_PANEL_HOST'])}'></div><div><label>面板端口</label><input name=WEB_PANEL_PORT value='{html_escape(v['WEB_PANEL_PORT'])}'></div><div><label>面板用户</label><input name=WEB_PANEL_USER value='{html_escape(v['WEB_PANEL_USER'])}'></div><div><label>面板密码</label><input name=WEB_PANEL_PASSWORD value='{html_escape(v['WEB_PANEL_PASSWORD'])}'></div></div>
 <input type=hidden name=WEB_PANEL_ENABLED value='true'><div class=form-actions><button class='btn primary' type=submit>保存配置</button> <a class=btn href='/restart'>重启机器人</a></div></form></div>"""
         body = settings_card + "<div class=card><h2>用户管理</h2><table><tr><th>用户</th><th>状态</th><th>备注</th><th>操作</th></tr>" + "".join(trs) + "</table></div>"
         return layout("用户管理", body)
 
     @app.post("/users/settings", response_class=HTMLResponse)
-    async def users_settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), RELAY_BOT_TOKEN: str = Form(""), MONITOR_BOT_TOKEN: str = Form(""), GROUP_BOT_TOKEN: str = Form(""), MONITOR_READ_COMMAND: str = Form("/r"), RELAY_VERIFY_MODE: str = Form("off"), RELAY_VERIFY_TIMEOUT_SECONDS: str = Form(""), PUBLIC_BASE_URL: str = Form(""), TURNSTILE_SITE_KEY: str = Form(""), TURNSTILE_SECRET_KEY: str = Form(""), RELAY_WELCOME_MESSAGE: str = Form(DEFAULT_RELAY_WELCOME_MESSAGE), RELAY_WELCOME_BUTTONS: str = Form(""), ADMIN_CHAT_ID: str = Form(""), ADMIN_ROUTE_MODE: str = Form("direct"), ADMIN_FORUM_GROUP_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin")) -> str:
+    async def users_settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), RELAY_BOT_TOKEN: str = Form(""), MONITOR_BOT_TOKEN: str = Form(""), GROUP_BOT_TOKEN: str = Form(""), MONITOR_READ_COMMAND: str = Form("/r"), RELAY_VERIFY_MODE: str = Form("off"), RELAY_VERIFY_TIMEOUT_SECONDS: str = Form(""), PUBLIC_BASE_URL: str = Form(""), TURNSTILE_SITE_KEY: str = Form(""), TURNSTILE_SECRET_KEY: str = Form(""), RELAY_WELCOME_MESSAGE: str = Form(DEFAULT_RELAY_WELCOME_MESSAGE), RELAY_WELCOME_BUTTONS: str = Form(""), ADMIN_CHAT_ID: str = Form(""), ADMIN_ROUTE_MODE: str = Form("direct"), ADMIN_FORUM_GROUP_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), TG_PROXY: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin")) -> str:
         cleanup = (cfg_load_fresh().get("cleanup") or {})
         save_panel_settings(
             locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED},

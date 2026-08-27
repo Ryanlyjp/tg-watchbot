@@ -24,6 +24,8 @@ def install_import_stubs() -> None:
     modules = {
         "feedparser": ModuleType("feedparser"),
         "httpx": ModuleType("httpx"),
+        "qrcode": ModuleType("qrcode"),
+        "socks": ModuleType("socks"),
         "yaml": ModuleType("yaml"),
         "uvicorn": ModuleType("uvicorn"),
         "apscheduler": ModuleType("apscheduler"),
@@ -44,6 +46,10 @@ def install_import_stubs() -> None:
     modules["apscheduler.schedulers.asyncio"].AsyncIOScheduler = object
     modules["bs4"].BeautifulSoup = object
     modules["dotenv"].load_dotenv = lambda *args, **kwargs: None
+    modules["qrcode"].make = lambda value: None
+    modules["socks"].SOCKS5 = 2
+    modules["socks"].SOCKS4 = 1
+    modules["socks"].HTTP = 3
     modules["yaml"].safe_load = lambda stream: {"bot": {"spam_filter": {"enabled": True, "keywords": []}}}
     modules["yaml"].safe_dump = lambda data, **kwargs: str(data)
     modules["aiogram"].Bot = object
@@ -1131,6 +1137,193 @@ class BotConfigurationTest(unittest.TestCase):
             finally:
                 app.ENV_PATH = old_env_path
 
+    def test_write_env_values_persists_telegram_session_and_proxy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            old_env_path = app.ENV_PATH
+            app.ENV_PATH = Path(temp_dir) / ".env"
+            try:
+                app.write_env_values({
+                    "TG_API_ID": "12345",
+                    "TG_API_HASH": "api-hash",
+                    "TG_API_SESSION": "saved-session",
+                    "TG_PROXY": "socks5://127.0.0.1:1080",
+                })
+                content = app.ENV_PATH.read_text(encoding="utf-8")
+                self.assertIn("TG_API_SESSION=saved-session", content)
+                self.assertIn("TG_PROXY=socks5://127.0.0.1:1080", content)
+            finally:
+                app.ENV_PATH = old_env_path
+
+
+class TelegramUserSessionTest(unittest.TestCase):
+    def test_build_telethon_proxy_supports_expected_schemes_and_auth(self) -> None:
+        self.assertIsNone(app._build_telethon_proxy(""))
+        socks5_proxy = app._build_telethon_proxy("socks5://user:p%40ss@127.0.0.1:1081")
+        self.assertEqual(app.socks.SOCKS5, socks5_proxy[0])
+        self.assertEqual(("127.0.0.1", 1081, True, "user", "p@ss"), socks5_proxy[1:])
+        self.assertEqual(app.socks.SOCKS4, app._build_telethon_proxy("socks4://proxy.local")[0])
+        self.assertEqual(1080, app._build_telethon_proxy("socks4://proxy.local")[2])
+        self.assertEqual(app.socks.HTTP, app._build_telethon_proxy("http://proxy.local:7890")[0])
+
+    def test_build_telethon_proxy_rejects_invalid_values(self) -> None:
+        for value in ["https://proxy.local", "socks5://", "socks5://proxy.local:bad", "socks5://proxy.local/path"]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                app._build_telethon_proxy(value)
+
+    def test_prepare_qr_uses_proxy_and_returns_png_data_uri(self) -> None:
+        old_client = app.TelegramClient
+        old_session = app.StringSession
+        old_make = app.qrcode.make
+        old_api_id = os.environ.get("TG_API_ID")
+        old_api_hash = os.environ.get("TG_API_HASH")
+        created: dict[str, object] = {}
+
+        class FakeQrImage:
+            def save(self, buffer, format="PNG"):
+                buffer.write(b"png-data")
+
+        class FakeClient:
+            def __init__(self, session, api_id, api_hash, proxy=None):
+                created.update(api_id=api_id, api_hash=api_hash, proxy=proxy)
+
+            async def connect(self):
+                created["connected"] = True
+
+            async def qr_login(self):
+                return SimpleNamespace(url="tg://login?token=test")
+
+            async def disconnect(self):
+                created["disconnected"] = True
+
+        app.TelegramClient = FakeClient
+        app.StringSession = lambda value="": value
+        app.qrcode.make = lambda value: FakeQrImage()
+        os.environ["TG_API_ID"] = "12345"
+        os.environ["TG_API_HASH"] = "api-hash"
+        try:
+            result = asyncio.run(app.telegram_login_prepare_qr("http://127.0.0.1:7890"))
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["qr_png"].startswith("data:image/png;base64,"))
+            self.assertEqual(app.socks.HTTP, created["proxy"][0])
+        finally:
+            app.TelegramClient = old_client
+            app.StringSession = old_session
+            app.qrcode.make = old_make
+            if old_api_id is None:
+                os.environ.pop("TG_API_ID", None)
+            else:
+                os.environ["TG_API_ID"] = old_api_id
+            if old_api_hash is None:
+                os.environ.pop("TG_API_HASH", None)
+            else:
+                os.environ["TG_API_HASH"] = old_api_hash
+
+    def test_complete_qr_persists_session_and_disconnects(self) -> None:
+        old_env_path = app.ENV_PATH
+
+        class FakeLogin:
+            async def wait(self):
+                return None
+
+        class FakeClient:
+            def __init__(self):
+                self.session = SimpleNamespace(save=lambda: "qr-session")
+                self.disconnected = False
+
+            async def get_me(self):
+                return SimpleNamespace(username="alice", phone="123", id=99)
+
+            async def disconnect(self):
+                self.disconnected = True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app.ENV_PATH = Path(temp_dir) / ".env"
+            client = FakeClient()
+            try:
+                result = asyncio.run(app.telegram_login_complete(client, FakeLogin()))
+                self.assertEqual("alice", result["username"])
+                self.assertTrue(client.disconnected)
+                self.assertIn("TG_API_SESSION=qr-session", app.ENV_PATH.read_text(encoding="utf-8"))
+            finally:
+                app.ENV_PATH = old_env_path
+
+    def test_logout_clears_session_and_disconnects_active_client(self) -> None:
+        old_env_path = app.ENV_PATH
+        old_client = app.user_session_client
+        old_session = os.environ.get("TG_API_SESSION")
+
+        class FakeClient:
+            def __init__(self):
+                self.disconnected = False
+
+            async def disconnect(self):
+                self.disconnected = True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app.ENV_PATH = Path(temp_dir) / ".env"
+            app.ENV_PATH.write_text("TG_API_SESSION=active-session\n", encoding="utf-8")
+            client = FakeClient()
+            app.user_session_client = client
+            os.environ["TG_API_SESSION"] = "active-session"
+            try:
+                asyncio.run(app.telegram_logout())
+                self.assertTrue(client.disconnected)
+                self.assertIsNone(app.user_session_client)
+                self.assertIn("TG_API_SESSION=\n", app.ENV_PATH.read_text(encoding="utf-8"))
+            finally:
+                app.ENV_PATH = old_env_path
+                app.user_session_client = old_client
+                if old_session is None:
+                    os.environ.pop("TG_API_SESSION", None)
+                else:
+                    os.environ["TG_API_SESSION"] = old_session
+
+    def test_user_session_listener_passes_configured_proxy(self) -> None:
+        old_client = app.TelegramClient
+        old_session = app.StringSession
+        old_events = app.events
+        old_values = {key: os.environ.get(key) for key in ("TG_API_ID", "TG_API_HASH", "TG_API_SESSION", "TG_PROXY")}
+        captured: dict[str, object] = {}
+
+        class FakeClient:
+            def __init__(self, session, api_id, api_hash, proxy=None):
+                captured["proxy"] = proxy
+
+            def on(self, event):
+                return lambda func: func
+
+            async def start(self):
+                return None
+
+            async def run_until_disconnected(self):
+                return None
+
+            async def disconnect(self):
+                return None
+
+        app.TelegramClient = FakeClient
+        app.StringSession = lambda value="": value
+        app.events = SimpleNamespace(NewMessage=lambda **kwargs: object())
+        os.environ.update({
+            "TG_API_ID": "12345",
+            "TG_API_HASH": "api-hash",
+            "TG_API_SESSION": "session",
+            "TG_PROXY": "socks5://127.0.0.1:1080",
+        })
+        try:
+            asyncio.run(app.run_user_session_group_listener())
+            self.assertEqual(app.socks.SOCKS5, captured["proxy"][0])
+        finally:
+            app.TelegramClient = old_client
+            app.StringSession = old_session
+            app.events = old_events
+            app.user_session_client = None
+            for key, value in old_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
 
 class PanelHtmlContractTest(unittest.TestCase):
     def test_login_form_keeps_expected_fields(self) -> None:
@@ -1138,6 +1331,23 @@ class PanelHtmlContractTest(unittest.TestCase):
         self.assertIn("action=/login", html)
         self.assertIn("name=username", html)
         self.assertIn("name=password", html)
+
+    def test_login_and_panel_layout_include_persistent_theme_toggle(self) -> None:
+        for html in [app.login_page(), app.layout("测试", "<p>ok</p>")]:
+            self.assertIn("data-theme-toggle", html)
+            self.assertIn("tg_watchbot_theme", html)
+            self.assertIn("data-theme='dark'", html)
+
+    def test_settings_source_includes_qr_login_proxy_and_logout(self) -> None:
+        source = Path("app.py").read_text(encoding="utf-8")
+        for expected in [
+            "name=TG_PROXY",
+            'TG_PROXY: str = Form("")',
+            '/api/tg-login/qr',
+            '/api/tg-login/status',
+            '/api/tg-login/logout',
+        ]:
+            self.assertIn(expected, source)
 
     def test_monitor_form_keeps_backend_field_names(self) -> None:
         html = app.monitor_form_html()
