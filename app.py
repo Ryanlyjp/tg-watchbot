@@ -278,7 +278,7 @@ def forum_monitor_templates() -> dict[str, dict[str, Any]]:
     templates["linuxsb"] = {
         "name": "Linux.SB 最新",
         "type": "web",
-        "url": "https://linux.sb",
+        "url": "https://linux.sb/index.php?sort=post",
         "interval_seconds": 180,
         "keywords": list(DEFAULT_FORUM_KEYWORDS),
         "exclude_keywords": [],

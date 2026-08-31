@@ -37,6 +37,7 @@ class RssParsingTest(unittest.TestCase):
 
     def test_linuxsb_web_template_parses_topic_cards_with_stable_ids(self) -> None:
         monitor = app.forum_monitor_templates()["linuxsb"]
+        self.assertEqual("https://linux.sb/index.php?sort=post", monitor["url"])
         body = """
         <div class="post-list">
           <div class="post-item"><a class="post-title" href="/topic/16277">VPS 优惠</a></div>

@@ -93,7 +93,7 @@ monitors:
   baseline_on_first_run: true
 - name: Linux.SB 最新
   type: web
-  url: https://linux.sb
+  url: https://linux.sb/index.php?sort=post
   interval_seconds: 180
   keywords:
   - 优惠
