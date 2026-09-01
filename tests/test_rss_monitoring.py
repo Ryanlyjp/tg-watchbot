@@ -78,22 +78,28 @@ class RssParsingTest(unittest.TestCase):
         self.assertNotIn("发布时间", linuxsb + rss)
         self.assertNotIn("检查时间", linuxsb + rss)
 
-    def test_exclude_keywords_match_title_and_content_only(self) -> None:
+    def test_exclude_keywords_match_every_monitor_item_field(self) -> None:
         item = app.MonitorItem(
             key="1",
             title="普通标题",
-            link="https://example.com/1",
+            link="https://example.com/private-link",
             text="正文包含 PROMOTION 内容",
+            price="99 USD",
+            stock="有货",
             author="屏蔽作者",
             category="屏蔽分类",
+            published="2026-08-31T00:00:00+00:00",
         )
 
         blocked, reason = app.item_blocked(item, {"exclude_keywords": ["promotion"]})
         self.assertTrue(blocked)
         self.assertIn("promotion", reason)
 
-        blocked, _ = app.item_blocked(item, {"exclude_keywords": ["屏蔽作者", "屏蔽分类"]})
-        self.assertFalse(blocked)
+        for word in ["private-link", "99 usd", "有货", "屏蔽作者", "屏蔽分类", "2026-08-31"]:
+            with self.subTest(word=word):
+                blocked, reason = app.item_blocked(item, {"exclude_keywords": [word]})
+                self.assertTrue(blocked)
+                self.assertIn(word, reason)
 
     def test_gbk_feed_bytes_are_decoded_by_feedparser(self) -> None:
         xml = (
@@ -178,6 +184,20 @@ class MonitorBaselineTest(unittest.TestCase):
 
         self.assertEqual(0, send.await_count)
         self.assertTrue(app.monitor_has_state("过滤测试"))
+
+    def test_exclude_keywords_block_rendered_notification_fields(self) -> None:
+        monitor = app.rss_forum_template("内部监控", "https://example.com/feed.xml", 60)
+        monitor["baseline_on_first_run"] = False
+        monitor["exclude_keywords"] = ["内部监控"]
+        feed = rss_bytes([("普通新帖", "https://example.com/t/201", "201")])
+
+        with patch.object(app, "fetch_url", new=AsyncMock(return_value=feed)), patch.object(
+            app, "admin_send_monitor", new=AsyncMock(return_value=True)
+        ) as send:
+            self.assertEqual(0, asyncio.run(app.run_monitor(monitor)))
+
+        self.assertEqual(0, send.await_count)
+        self.assertTrue(app.monitor_has_state("内部监控"))
 
     def test_linuxsb_does_not_repeat_keyword_matches_without_forum_flag(self) -> None:
         monitor = app.forum_monitor_templates()["linuxsb"]

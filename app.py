@@ -1570,6 +1570,31 @@ def group_message_text(message: Message) -> str:
     return merged.strip()
 
 
+def group_message_filter_text(message: Message, monitor: dict[str, Any]) -> str:
+    sender = getattr(message, "from_user", None)
+    chat = getattr(message, "chat", None)
+    return " ".join(
+        str(value or "")
+        for value in [
+            monitor.get("name"),
+            getattr(chat, "title", ""),
+            getattr(chat, "username", ""),
+            getattr(chat, "id", ""),
+            getattr(sender, "first_name", ""),
+            getattr(sender, "last_name", ""),
+            getattr(sender, "username", ""),
+            getattr(sender, "id", ""),
+            getattr(message, "message_id", ""),
+            telegram_message_link(
+                getattr(chat, "username", None),
+                int(getattr(chat, "id", 0) or 0),
+                int(getattr(message, "message_id", 0) or 0),
+            ),
+            group_message_text(message),
+        ]
+    )
+
+
 def group_message_context(message: Message, monitor: dict[str, Any], hits: list[str]) -> str:
     chat_title = getattr(message.chat, "title", "") or str(message.chat.id)
     username = getattr(message.from_user, "username", None)
@@ -1813,7 +1838,7 @@ async def handle_group_keyword_message(message: Message, listen_source: str = "b
     text = group_message_text(message)
     if not text:
         return False
-    exclude_hits = keyword_hits(text, monitor.get("exclude_keywords") or [])
+    exclude_hits = keyword_hits(group_message_filter_text(message, monitor), monitor.get("exclude_keywords") or [])
     if exclude_hits:
         return False
     hits = keyword_hits(text, monitor.get("keywords") or [])
@@ -1821,6 +1846,9 @@ async def handle_group_keyword_message(message: Message, listen_source: str = "b
         return False
     if not monitor.get("notify_telegram", True):
         return True
+    summary = await summarize_group_message(message, monitor, hits)
+    if keyword_hits(html.unescape(summary), monitor.get("exclude_keywords") or []):
+        return False
     fp = group_monitor_fingerprint(message, monitor, hits)
     allow, reason = group_monitor_allow_send(monitor, fp)
     if not allow:
@@ -1832,7 +1860,7 @@ async def handle_group_keyword_message(message: Message, listen_source: str = "b
             reason,
         )
         return False
-    await admin_send_group(await summarize_group_message(message, monitor, hits))
+    await admin_send_group(summary)
     return True
 
 
@@ -2888,9 +2916,25 @@ def keyword_hits(text: str, keywords: list[str]) -> list[str]:
     return [k for k in keywords if k and k.lower() in low]
 
 
+def monitor_item_filter_text(item: MonitorItem) -> str:
+    return " ".join(
+        str(value or "")
+        for value in [
+            item.key,
+            item.title,
+            item.link,
+            item.text,
+            item.price,
+            item.stock,
+            item.author,
+            item.published,
+            item.category,
+        ]
+    )
+
+
 def item_blocked(item: MonitorItem, monitor: dict[str, Any]) -> tuple[bool, str]:
-    text = f"{item.title} {item.text}"
-    exclude_hits = keyword_hits(text, monitor.get("exclude_keywords") or [])
+    exclude_hits = keyword_hits(monitor_item_filter_text(item), monitor.get("exclude_keywords") or [])
     if exclude_hits:
         return True, "屏蔽词 " + ", ".join(exclude_hits)
     authors = [a.lower() for a in (monitor.get("authors") or []) if a]
@@ -3419,6 +3463,9 @@ async def run_monitor(monitor: dict[str, Any]) -> int:
                     f"库存：{html_escape(item.stock or '-')}\n"
                     f"时间：{html_escape(now_iso())}"
                 )
+            if keyword_hits(html.unescape(text), monitor.get("exclude_keywords") or []):
+                logger.debug("monitor %s skipped rendered notification for item %s", name, item.title)
+                continue
             record_monitor_event(name, item.title, item.link, reasons, notify_on_tg)
             if not notify_on_tg:
                 sent_count += 1
@@ -4184,7 +4231,7 @@ def monitor_form_html(m: dict[str, Any] | None = None, idx: int | None = None) -
 <div><label>URL</label><input name=url value='{html_escape(m.get('url',''))}' required></div>
 <div><label>间隔秒数（最低 60）</label><input name=interval_seconds type=number min=60 value='{html_escape(m.get('interval_seconds',60))}'></div></div>
 <label>关键词（一行一个）</label><textarea name=keywords>{html_escape(keywords)}</textarea>
-<label>屏蔽关键词（一行一个）</label><textarea name=exclude_keywords placeholder='标题或正文命中任意一项时不推送'>{html_escape(exclude_keywords)}</textarea>
+<label>屏蔽关键词（一行一个）</label><textarea name=exclude_keywords placeholder='推送内容任一字段命中即不推送'>{html_escape(exclude_keywords)}</textarea>
 <h3>Web 选择器（RSS 可忽略）</h3><div class=grid>
 <div><label>条目选择器</label><input name=item_selector value='{html_escape(selectors.get('item','article, .thread, .post, li'))}'></div>
 <div><label>标题选择器</label><input name=title_selector value='{html_escape(selectors.get('title','h1, h2, h3, a'))}'></div>

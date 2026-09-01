@@ -1702,6 +1702,42 @@ class MonitorRuntimeAndUpdateTest(unittest.TestCase):
             app.bot = old_bot
             app.admin_chat_ids = old_admin_chat_ids
 
+    def test_handle_group_keyword_message_filters_all_notification_fields(self) -> None:
+        old_config = app.config
+        old_bot = app.bot
+        old_admin_chat_ids = app.admin_chat_ids
+        fake_bot = FakeBot()
+        app.bot = fake_bot
+        app.admin_chat_ids = [9001]
+        app.config = {
+            "group_monitors": [
+                {
+                    "enabled": True,
+                    "name": "内部群监听",
+                    "chat_id": -100100100,
+                    "keywords": ["vps"],
+                    "exclude_keywords": ["内部群监听"],
+                    "notify_telegram": True,
+                }
+            ]
+        }
+        msg = SimpleNamespace(
+            chat=SimpleNamespace(id=-100100100, username="groupdemo", title="公开群"),
+            from_user=SimpleNamespace(id=123, first_name="Alice", last_name="", username="alice"),
+            text="vps 优惠",
+            caption=None,
+            reply_to_message=None,
+            message_id=777,
+            content_type="text",
+        )
+        try:
+            self.assertFalse(asyncio.run(app.handle_group_keyword_message(msg)))
+            self.assertEqual([], fake_bot.sent_chat_ids)
+        finally:
+            app.config = old_config
+            app.bot = old_bot
+            app.admin_chat_ids = old_admin_chat_ids
+
     def test_group_ai_summary_fallback_to_template_when_ai_fails(self) -> None:
         old_config = app.config
         old_bot = app.bot

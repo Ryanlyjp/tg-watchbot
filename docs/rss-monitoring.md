@@ -19,6 +19,8 @@ It is configured as a forum monitor with `baseline_on_first_run: true`, so the c
 
 Forum notifications sent to Telegram include the title, link, and match reason. Telegram already displays the delivery time, so published and check times are omitted from the message only; monitor events and their creation time remain available in the panel. Linux.SB also omits author and category because its homepage topic list does not provide them.
 
+`exclude_keywords` is a notification filter, not only a title filter. It checks every parsed item field (title, body, link, author, category, publication time, price, and stock) and checks the rendered Telegram notification before it is sent. Blocked items still enter the deduplication state, so removing a word later does not replay an old item.
+
 ## Cloudflare handling
 
 SB.SB is fetched with the ordinary RSS client. IDCFLARE returns a Cloudflare browser challenge to ordinary clients and to `curl`, so the application falls back to the internal `flaresolverr` Docker service only after detecting that challenge.
