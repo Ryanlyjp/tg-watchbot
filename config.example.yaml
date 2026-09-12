@@ -134,6 +134,60 @@ group_monitors:
   ai_prompt: ''
   ai_min_interval_seconds: 30
   ai_dedupe_window_seconds: 300
+cn_biomed:
+  enabled: true
+  translate_titles: true
+  max_age_hours: 36
+  dedupe_days: 10
+  feeds:
+  - name: Google News 中国 IVD
+    url: "https://news.google.com/rss/search?q=%28%22%E4%BD%93%E5%A4%96%E8%AF%8A%E6%96%AD%22+OR+IVD+OR+%22%E5%88%86%E5%AD%90%E8%AF%8A%E6%96%AD%22+OR+POCT+OR+%22%E4%BC%B4%E9%9A%8F%E8%AF%8A%E6%96%AD%22+OR+%22%E6%B6%B2%E4%BD%93%E6%B4%BB%E6%A3%80%22+OR+%22%E8%AF%8A%E6%96%AD%E8%AF%95%E5%89%82%22%29+when%3A1d&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+    enabled: true
+    interval_seconds: 600
+    keywords: [体外诊断, IVD, 分子诊断, POCT, 伴随诊断, 液体活检, 诊断试剂, 检测试剂, 注册证, 试剂盒]
+    exclude_keywords: [ETF, 基金, 重仓股, 股价异动, 主力资金, 融资融券, 大宗交易, 股票行情]
+    sources: []
+    baseline_on_first_run: false
+  - name: Google News 中国 IVD 厂家
+    url: "https://news.google.com/rss/search?q=%28%22%E8%BF%88%E7%91%9E%E5%8C%BB%E7%96%97%22+OR+%22%E5%AE%89%E5%9B%BE%E7%94%9F%E7%89%A9%22+OR+%22%E6%96%B0%E4%BA%A7%E4%B8%9A%22+OR+%22%E8%BF%88%E5%85%8B%E7%94%9F%E7%89%A9%22+OR+%22%E4%B8%87%E5%AD%9A%E7%94%9F%E7%89%A9%22+OR+%22%E5%9C%A3%E6%B9%98%E7%94%9F%E7%89%A9%22+OR+%22%E8%BE%BE%E5%AE%89%E5%9F%BA%E5%9B%A0%22+OR+%22%E8%BF%AA%E7%91%9E%E5%8C%BB%E7%96%97%22+OR+%22%E4%B8%9C%E6%96%B9%E7%94%9F%E7%89%A9%22+OR+%22%E4%BA%9A%E8%BE%89%E9%BE%99%22+OR+%22%E7%A7%91%E5%8D%8E%E7%94%9F%E7%89%A9%22+OR+%22%E5%9F%BA%E8%9B%8B%E7%94%9F%E7%89%A9%22+OR+%22%E8%89%BE%E5%BE%B7%E7%94%9F%E7%89%A9%22+OR+%22%E5%8D%8E%E5%A4%A7%E5%9F%BA%E5%9B%A0%22%29+%28%22%E4%BD%93%E5%A4%96%E8%AF%8A%E6%96%AD%22+OR+IVD+OR+%22%E5%88%86%E5%AD%90%E8%AF%8A%E6%96%AD%22+OR+POCT+OR+%22%E4%BC%B4%E9%9A%8F%E8%AF%8A%E6%96%AD%22+OR+%22%E6%A3%80%E6%B5%8B%E8%AF%95%E5%89%82%22+OR+%22%E8%AF%8A%E6%96%AD%E4%BB%AA%E5%99%A8%22%29+when%3A1d&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+    enabled: true
+    interval_seconds: 600
+    keywords: [体外诊断, IVD, 分子诊断, POCT, 伴随诊断, 检测试剂, 诊断仪器, 注册证, 试剂盒, 临床验证]
+    exclude_keywords: [ETF, 基金, 重仓股, 股价异动, 主力资金, 融资融券, 大宗交易, 股票行情]
+    sources: []
+    baseline_on_first_run: false
+  - name: Google News 国际 IVD
+    url: "https://news.google.com/rss/search?q=%28%22in+vitro+diagnostics%22+OR+%22molecular+diagnostics%22+OR+%22companion+diagnostic%22+OR+%22liquid+biopsy%22+OR+%22point-of-care+diagnostic%22%29+%28FDA+OR+clearance+OR+approval+OR+launch+OR+recall+OR+acquisition%29+when%3A1d&hl=en-US&gl=US&ceid=US:en"
+    enabled: true
+    interval_seconds: 600
+    keywords: [in vitro diagnostic, molecular diagnostic, companion diagnostic, liquid biopsy, point-of-care, diagnostics, diagnostic assay, diagnostic test, diagnostic analyzer]
+    exclude_keywords: [stock price, shares]
+    sources: []
+    baseline_on_first_run: false
+  - name: Google News 国际 IVD 厂家
+    url: "https://news.google.com/rss/search?q=%28%22Roche+Diagnostics%22+OR+%22Abbott+Diagnostics%22+OR+%22Siemens+Healthineers+Diagnostics%22+OR+%22Beckman+Coulter+Diagnostics%22+OR+bioM%C3%A9rieux+OR+QIAGEN+OR+Sysmex+OR+Hologic+OR+QuidelOrtho+OR+%22Bio-Rad%22+OR+Cepheid%29+%28assay+OR+diagnostic+OR+analyzer+OR+clearance+OR+approval+OR+launch%29+when%3A1d&hl=en-US&gl=US&ceid=US:en"
+    enabled: true
+    interval_seconds: 600
+    keywords: [in vitro diagnostic, molecular diagnostic, companion diagnostic, liquid biopsy, point-of-care, diagnostics, diagnostic assay, diagnostic test, diagnostic analyzer]
+    exclude_keywords: [stock price, shares]
+    sources: []
+    baseline_on_first_run: false
+  - name: BD 官方新闻
+    url: https://investors.bd.com/news-events/press-releases/rss
+    enabled: true
+    interval_seconds: 600
+    keywords: [in vitro diagnostic, molecular diagnostic, companion diagnostic, liquid biopsy, point-of-care, diagnostics, diagnostic assay, diagnostic test, diagnostic analyzer]
+    exclude_keywords: []
+    sources: []
+    baseline_on_first_run: false
+  - name: MedTech Dive
+    url: https://www.medtechdive.com/feeds/news/
+    enabled: true
+    interval_seconds: 600
+    keywords: [in vitro diagnostic, molecular diagnostic, companion diagnostic, liquid biopsy, point-of-care, diagnostics, diagnostic assay, diagnostic test, diagnostic analyzer]
+    exclude_keywords: []
+    sources: []
+    baseline_on_first_run: false
 cleanup:
   enabled: true
   interval_minutes: 60

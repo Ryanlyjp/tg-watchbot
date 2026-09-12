@@ -36,6 +36,8 @@ services:
     restart: unless-stopped
     environment:
       LOG_LEVEL: warning
+    volumes:
+      - ./docker-data/flaresolverr:/config
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=134217728
     cap_drop:

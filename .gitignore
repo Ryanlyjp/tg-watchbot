@@ -20,3 +20,5 @@ forwarder/temp/
 forwarder/ufb/
 forwarder/config/
 forwarder/rss/
+docker-data/
+docs/

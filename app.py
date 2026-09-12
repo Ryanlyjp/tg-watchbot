@@ -25,7 +25,8 @@ import sqlite3
 import time
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -172,6 +173,11 @@ DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS = 300
 DEFAULT_RELAY_VERIFY_TIMEOUT_SECONDS = 180
 DEFAULT_TURNSTILE_VERIFY_TIMEOUT_SECONDS = 600
 DEFAULT_RELAY_WELCOME_MESSAGE = "已连接客服/管理员。你发来的消息会转交给管理员，请直接输入内容。"
+CN_BIOMED_STATE_PREFIX = "CN生物医药::"
+CN_BIOMED_DEDUPE_STATE = "__cn_biomed_dedupe__"
+DEFAULT_CN_BIOMED_MAX_AGE_HOURS = 36
+DEFAULT_CN_BIOMED_DEDUPE_DAYS = 10
+DEFAULT_CN_BIOMED_INTERVAL_SECONDS = 600
 
 DEFAULT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -206,6 +212,144 @@ DEFAULT_FORUM_KEYWORDS = [
     "焚诀",
     "焚决",
 ]
+
+DEFAULT_IVD_KEYWORDS = [
+    "体外诊断",
+    "IVD",
+    "分子诊断",
+    "POCT",
+    "即时检测",
+    "伴随诊断",
+    "液体活检",
+    "诊断试剂",
+    "检测试剂",
+    "诊断仪器",
+    "免疫诊断",
+    "生化诊断",
+    "病理诊断",
+    "核酸检测",
+    "in vitro diagnostic",
+    "molecular diagnostic",
+    "companion diagnostic",
+    "liquid biopsy",
+    "point-of-care",
+    "diagnostics",
+    "diagnostic assay",
+    "diagnostic test",
+    "diagnostic analyzer",
+]
+
+DEFAULT_IVD_EXCLUDE_KEYWORDS = [
+    "ETF",
+    "基金",
+    "份额",
+    "重仓股",
+    "股价异动",
+    "主力资金",
+    "融资融券",
+    "融资净",
+    "大宗交易",
+    "股东减持",
+    "股票行情",
+]
+
+
+def google_news_rss_url(query: str, language: str, country: str, edition: str) -> str:
+    return (
+        f"https://news.google.com/rss/search?q={quote_plus(query)}"
+        f"&hl={language}&gl={country}&ceid={edition}"
+    )
+
+
+def default_cn_biomed_feeds() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "Google News 中国 IVD",
+            "url": google_news_rss_url(
+                '("体外诊断" OR IVD OR "分子诊断" OR POCT OR "伴随诊断" OR "液体活检" OR "诊断试剂") when:1d',
+                "zh-CN",
+                "CN",
+                "CN:zh-Hans",
+            ),
+            "enabled": True,
+            "interval_seconds": DEFAULT_CN_BIOMED_INTERVAL_SECONDS,
+            "keywords": list(DEFAULT_IVD_KEYWORDS) + ["注册证", "试剂盒"],
+            "exclude_keywords": list(DEFAULT_IVD_EXCLUDE_KEYWORDS),
+            "sources": [],
+            "baseline_on_first_run": False,
+        },
+        {
+            "name": "Google News 中国 IVD 厂家",
+            "url": google_news_rss_url(
+                '("迈瑞医疗" OR "安图生物" OR "新产业" OR "迈克生物" OR "万孚生物" OR "圣湘生物" OR '
+                '"达安基因" OR "迪瑞医疗" OR "东方生物" OR "亚辉龙" OR "科华生物" OR "基蛋生物" OR '
+                '"艾德生物" OR "华大基因") ("体外诊断" OR IVD OR "分子诊断" OR POCT OR "伴随诊断" OR '
+                '"检测试剂" OR "诊断仪器") when:1d',
+                "zh-CN",
+                "CN",
+                "CN:zh-Hans",
+            ),
+            "enabled": True,
+            "interval_seconds": DEFAULT_CN_BIOMED_INTERVAL_SECONDS,
+            "keywords": list(DEFAULT_IVD_KEYWORDS) + ["注册证", "试剂盒", "临床验证"],
+            "exclude_keywords": list(DEFAULT_IVD_EXCLUDE_KEYWORDS),
+            "sources": [],
+            "baseline_on_first_run": False,
+        },
+        {
+            "name": "Google News 国际 IVD",
+            "url": google_news_rss_url(
+                '("in vitro diagnostics" OR "molecular diagnostics" OR "companion diagnostic" OR "liquid biopsy" OR '
+                '"point-of-care diagnostic") (FDA OR clearance OR approval OR launch OR recall OR acquisition) when:1d',
+                "en-US",
+                "US",
+                "US:en",
+            ),
+            "enabled": True,
+            "interval_seconds": DEFAULT_CN_BIOMED_INTERVAL_SECONDS,
+            "keywords": list(DEFAULT_IVD_KEYWORDS),
+            "exclude_keywords": list(DEFAULT_IVD_EXCLUDE_KEYWORDS),
+            "sources": [],
+            "baseline_on_first_run": False,
+        },
+        {
+            "name": "Google News 国际 IVD 厂家",
+            "url": google_news_rss_url(
+                '("Roche Diagnostics" OR "Abbott Diagnostics" OR "Siemens Healthineers Diagnostics" OR '
+                '"Beckman Coulter Diagnostics" OR bioMérieux OR QIAGEN OR Sysmex OR Hologic OR QuidelOrtho OR '
+                '"Bio-Rad" OR Cepheid) (assay OR diagnostic OR analyzer OR clearance OR approval OR launch) when:1d',
+                "en-US",
+                "US",
+                "US:en",
+            ),
+            "enabled": True,
+            "interval_seconds": DEFAULT_CN_BIOMED_INTERVAL_SECONDS,
+            "keywords": list(DEFAULT_IVD_KEYWORDS),
+            "exclude_keywords": list(DEFAULT_IVD_EXCLUDE_KEYWORDS),
+            "sources": [],
+            "baseline_on_first_run": False,
+        },
+        {
+            "name": "BD 官方新闻",
+            "url": "https://investors.bd.com/news-events/press-releases/rss",
+            "enabled": True,
+            "interval_seconds": DEFAULT_CN_BIOMED_INTERVAL_SECONDS,
+            "keywords": list(DEFAULT_IVD_KEYWORDS),
+            "exclude_keywords": list(DEFAULT_IVD_EXCLUDE_KEYWORDS),
+            "sources": [],
+            "baseline_on_first_run": False,
+        },
+        {
+            "name": "MedTech Dive",
+            "url": "https://www.medtechdive.com/feeds/news/",
+            "enabled": True,
+            "interval_seconds": DEFAULT_CN_BIOMED_INTERVAL_SECONDS,
+            "keywords": list(DEFAULT_IVD_KEYWORDS),
+            "exclude_keywords": list(DEFAULT_IVD_EXCLUDE_KEYWORDS),
+            "sources": [],
+            "baseline_on_first_run": False,
+        },
+    ]
 
 
 def rss_forum_template(name: str, url: str, interval_seconds: int = 180) -> dict[str, Any]:
@@ -305,9 +449,11 @@ router = Router()
 BOT_ROLE_RELAY = "relay"
 BOT_ROLE_MONITOR = "monitor"
 BOT_ROLE_GROUP = "group"
+BOT_ROLE_CN_BIOMED = "cn_biomed"
 bot: Bot | None = None
 monitor_bot: Bot | None = None
 group_bot: Bot | None = None
+cn_biomed_bot: Bot | None = None
 admin_chat_id: int | None = None
 admin_chat_ids: list[int] = []
 config: dict[str, Any] = {}
@@ -354,6 +500,21 @@ def monitor_cleanup_settings() -> dict[str, int | bool]:
             ),
         ),
         "message_delete_mode": mode if mode in {"ttl", "after_read"} else "ttl",
+    }
+
+
+def cn_biomed_settings(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    source = cfg if isinstance(cfg, dict) else config
+    raw = (source.get("cn_biomed") or {}) if isinstance(source, dict) else {}
+    feeds = raw.get("feeds") or []
+    if not isinstance(feeds, list):
+        feeds = []
+    return {
+        "enabled": bool(raw.get("enabled", True)),
+        "translate_titles": bool(raw.get("translate_titles", True)),
+        "max_age_hours": max(1, safe_int(raw.get("max_age_hours"), DEFAULT_CN_BIOMED_MAX_AGE_HOURS)),
+        "dedupe_days": max(1, safe_int(raw.get("dedupe_days"), DEFAULT_CN_BIOMED_DEDUPE_DAYS)),
+        "feeds": [row for row in feeds if isinstance(row, dict)],
     }
 
 
@@ -859,6 +1020,7 @@ def bot_token_env_name(role: str) -> str:
         BOT_ROLE_RELAY: "RELAY_BOT_TOKEN",
         BOT_ROLE_MONITOR: "MONITOR_BOT_TOKEN",
         BOT_ROLE_GROUP: "GROUP_BOT_TOKEN",
+        BOT_ROLE_CN_BIOMED: "CN_BIOMED_BOT_TOKEN",
     }.get(role, "TELEGRAM_BOT_TOKEN")
 
 
@@ -923,7 +1085,17 @@ def role_bot_token(role: str) -> str:
     specific = os.getenv(bot_token_env_name(role), "").strip()
     if specific:
         return specific
+    if role == BOT_ROLE_CN_BIOMED:
+        return ""
     return os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
+
+def cn_biomed_chat_id() -> int | None:
+    load_dotenv(ENV_PATH, override=True)
+    try:
+        return parse_optional_chat_id(os.getenv("CN_BIOMED_CHAT_ID", ""))
+    except ValueError:
+        return None
 
 
 def notification_route_configured() -> bool:
@@ -945,6 +1117,10 @@ def group_bot_env_configured() -> bool:
     return bool(role_bot_token(BOT_ROLE_GROUP)) and notification_route_configured()
 
 
+def cn_biomed_bot_env_configured() -> bool:
+    return bool(role_bot_token(BOT_ROLE_CN_BIOMED)) and cn_biomed_chat_id() is not None
+
+
 def role_env_configured(role: str) -> bool:
     if role == BOT_ROLE_RELAY:
         return relay_bot_env_configured()
@@ -952,6 +1128,8 @@ def role_env_configured(role: str) -> bool:
         return monitor_bot_env_configured()
     if role == BOT_ROLE_GROUP:
         return group_bot_env_configured()
+    if role == BOT_ROLE_CN_BIOMED:
+        return cn_biomed_bot_env_configured()
     return False
 
 
@@ -962,6 +1140,8 @@ def role_bot_client(role: str) -> Bot | None:
         return monitor_bot or bot
     if role == BOT_ROLE_GROUP:
         return group_bot or bot
+    if role == BOT_ROLE_CN_BIOMED:
+        return cn_biomed_bot
     return None
 
 
@@ -1672,6 +1852,67 @@ def extract_chat_text(data: dict[str, Any]) -> str:
     return ""
 
 
+def cn_biomed_ai_settings() -> dict[str, Any]:
+    load_dotenv(ENV_PATH, override=True)
+    interface = os.getenv("CN_BIOMED_AI_INTERFACE", "responses").strip().lower()
+    if interface not in {"responses", "chat"}:
+        interface = "responses"
+    return {
+        "base_url": os.getenv("CN_BIOMED_AI_BASE_URL", "").strip(),
+        "api_key": os.getenv("CN_BIOMED_AI_API_KEY", "").strip(),
+        "model": os.getenv("CN_BIOMED_AI_MODEL", "gpt-4o-mini").strip(),
+        "interface": interface,
+        "timeout_seconds": max(1, safe_int(os.getenv("CN_BIOMED_AI_TIMEOUT_SECONDS", "30"), 30)),
+    }
+
+
+def title_needs_chinese_translation(title: str) -> bool:
+    return not bool(re.search(r"[\u3400-\u9fff]", title or ""))
+
+
+def clean_translated_title(value: str) -> str:
+    title = " ".join(str(value or "").strip().splitlines()).strip()
+    title = re.sub(r"^(?:翻译|中文标题|标题)\s*[:：]\s*", "", title, flags=re.I)
+    return title.strip(" \t\"'“”‘’")
+
+
+async def translate_cn_biomed_title(title: str) -> str:
+    if not title_needs_chinese_translation(title):
+        return title
+    settings = cn_biomed_ai_settings()
+    if not settings["base_url"] or not settings["api_key"] or not settings["model"]:
+        return title
+    system_prompt = (
+        "你是 IVD 行业新闻标题翻译器。将英文标题准确翻译为简体中文，保留公司、产品、检测方法、监管状态和金额等专有信息。"
+        "只输出一行中文标题，不解释，不添加原文没有的信息。"
+    )
+    headers = {"Authorization": f"Bearer {settings['api_key']}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=int(settings["timeout_seconds"]), headers=headers) as client:
+        if settings["interface"] == "chat":
+            payload = {
+                "model": settings["model"],
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": title[:1000]},
+                ],
+                "temperature": 0,
+            }
+            response = await client.post(ai_api_url(settings["base_url"], "/chat/completions"), json=payload)
+            response.raise_for_status()
+            translated = extract_chat_text(response.json())
+        else:
+            payload = {
+                "model": settings["model"],
+                "instructions": system_prompt,
+                "input": title[:1000],
+                "max_output_tokens": 200,
+            }
+            response = await client.post(ai_api_url(settings["base_url"], "/responses"), json=payload)
+            response.raise_for_status()
+            translated = extract_responses_text(response.json())
+    return clean_translated_title(translated) or title
+
+
 def build_group_ai_system_prompt(custom_prompt: str) -> str:
     base = (
         "你是 Telegram 群消息摘要助手。"
@@ -2196,6 +2437,20 @@ async def admin_send_group(text: str) -> bool:
         except Exception:
             logger.exception("failed to send group notification chat_id=%s", chat_id)
     return sent_any
+
+
+async def send_cn_biomed_notification(text: str) -> bool:
+    notify_bot = role_bot_client(BOT_ROLE_CN_BIOMED)
+    target = cn_biomed_chat_id()
+    if not notify_bot or target is None:
+        logger.error("CN biomed notification skipped: dedicated Bot Token or Chat ID is not configured")
+        return False
+    try:
+        await notify_bot.send_message(target, text, disable_web_page_preview=False)
+        return True
+    except Exception:
+        logger.exception("failed to send CN biomed notification chat_id=%s", target)
+        return False
 
 
 def message_content_type(message: Message) -> str:
@@ -2899,6 +3154,7 @@ class MonitorItem:
     author: str | None = None
     published: str | None = None
     category: str | None = None
+    source: str | None = None
 
 
 def stable_key(*parts: str) -> str:
@@ -2929,6 +3185,7 @@ def monitor_item_filter_text(item: MonitorItem) -> str:
             item.author,
             item.published,
             item.category,
+            item.source,
         ]
     )
 
@@ -3179,8 +3436,12 @@ def parse_rss_items(monitor: dict[str, Any], body: str | bytes) -> list[MonitorI
         if tags:
             category = ", ".join([t.get("term", "") for t in tags if isinstance(t, dict) and t.get("term")])
         entry_id = getattr(e, "id", "") or getattr(e, "guid", "")
+        source_data = getattr(e, "source", None)
+        source = ""
+        if isinstance(source_data, dict):
+            source = str(source_data.get("title") or "").strip()
         key = canonical_forum_key(link, entry_id) if (monitor.get("forum") or monitor.get("type") == "rss") else stable_key(entry_id, link, title)
-        items.append(MonitorItem(key=key, title=title, link=link, text=f"{title} {summary} {content}", author=author, published=published, category=category))
+        items.append(MonitorItem(key=key, title=title, link=link, text=f"{title} {summary} {content}", author=author, published=published, category=category, source=source))
     if not items:
         detail = str(getattr(feed, "bozo_exception", "") or "").strip()
         raise ValueError(f"RSS/Atom 未解析到任何条目{': ' + detail if detail else ''}")
@@ -3481,6 +3742,185 @@ async def run_monitor(monitor: dict[str, Any]) -> int:
     return sent_count
 
 
+def cn_biomed_monitor(feed: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": CN_BIOMED_STATE_PREFIX + str(feed.get("name") or "unnamed"),
+        "type": "rss",
+        "url": str(feed.get("url") or ""),
+        "keywords": [str(value).strip() for value in (feed.get("keywords") or []) if str(value).strip()],
+        "exclude_keywords": [
+            str(value).strip() for value in (feed.get("exclude_keywords") or []) if str(value).strip()
+        ],
+        "baseline_on_first_run": bool(feed.get("baseline_on_first_run", True)),
+        "notify_on": {"keyword_match": True, "new_item": True},
+        "forum": True,
+    }
+
+
+def parse_feed_datetime(value: str | None) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = parsedate_to_datetime(raw)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        parsed = parse_iso_datetime(raw)
+        return parsed.astimezone(timezone.utc) if parsed else None
+
+
+def cn_biomed_item_is_recent(
+    item: MonitorItem,
+    max_age_hours: int,
+    current_time: datetime | None = None,
+) -> bool:
+    published = parse_feed_datetime(item.published)
+    if published is None:
+        return False
+    now = (current_time or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    age = now - published
+    return timedelta(0) <= age <= timedelta(hours=max(1, int(max_age_hours)))
+
+
+def cn_biomed_source_allowed(item: MonitorItem, feed: dict[str, Any]) -> bool:
+    allowed = {str(value).strip().casefold() for value in (feed.get("sources") or []) if str(value).strip()}
+    if not allowed:
+        return True
+    return str(item.source or "").strip().casefold() in allowed
+
+
+def cn_biomed_keyword_hits(item: MonitorItem, keywords: list[str]) -> list[str]:
+    plain_text = BeautifulSoup(item.text or "", "html.parser").get_text(" ", strip=True)
+    text = f"{item.title} {plain_text} {item.source or ''}"
+    hits: list[str] = []
+    for keyword in keywords:
+        value = str(keyword or "").strip()
+        if not value:
+            continue
+        if re.search(r"[A-Za-z0-9]", value):
+            pattern = rf"(?<![A-Za-z0-9]){re.escape(value)}(?![A-Za-z0-9])"
+            if re.search(pattern, text, re.I):
+                hits.append(value)
+        elif value.casefold() in text.casefold():
+            hits.append(value)
+    return hits
+
+
+def cn_biomed_display_title(title: str, source: str = "") -> str:
+    value = html.unescape(str(title or "")).strip()
+    source_value = str(source or "").strip()
+    if source_value:
+        value = re.sub(rf"\s*[-–—]\s*{re.escape(source_value)}\s*$", "", value, flags=re.I)
+    return value.strip()
+
+
+def normalize_cn_biomed_title(title: str, source: str = "") -> str:
+    value = cn_biomed_display_title(title, source)
+    value = re.sub(r"[^\w\u3400-\u9fff]+", "", value.casefold())
+    return value
+
+
+def reserve_cn_biomed_event(item: MonitorItem, dedupe_days: int) -> str | None:
+    normalized = normalize_cn_biomed_title(item.title, item.source or "")
+    if not normalized:
+        normalized = item.key
+    dedupe_key = stable_key(normalized)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, int(dedupe_days)))).astimezone().isoformat(timespec="seconds")
+    with closing(db()) as conn:
+        conn.execute(
+            "DELETE FROM monitor_state WHERE monitor_name=? AND updated_at < ?",
+            (CN_BIOMED_DEDUPE_STATE, cutoff),
+        )
+        try:
+            conn.execute(
+                "INSERT INTO monitor_state(monitor_name, item_key, title, link, updated_at) VALUES(?,?,?,?,?)",
+                (CN_BIOMED_DEDUPE_STATE, dedupe_key, item.title, item.link, now_iso()),
+            )
+            conn.commit()
+            return dedupe_key
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            return None
+
+
+def release_cn_biomed_event(dedupe_key: str) -> None:
+    with closing(db()) as conn:
+        conn.execute(
+            "DELETE FROM monitor_state WHERE monitor_name=? AND item_key=?",
+            (CN_BIOMED_DEDUPE_STATE, dedupe_key),
+        )
+        conn.commit()
+
+
+async def run_cn_biomed_feed(feed: dict[str, Any]) -> int:
+    settings = cn_biomed_settings()
+    monitor = cn_biomed_monitor(feed)
+    name = monitor["name"]
+    url = monitor["url"]
+    started = time.time()
+    sent_count = 0
+    if not settings["enabled"] or not feed.get("enabled", True):
+        return 0
+    if not url:
+        record_monitor_runtime(name, False, int((time.time() - started) * 1000), 0, "missing url")
+        return 0
+    if not cn_biomed_bot_env_configured():
+        record_monitor_runtime(name, False, int((time.time() - started) * 1000), 0, "dedicated Bot Token or Chat ID is not configured")
+        return 0
+    timeout = int((config.get("http") or {}).get("timeout_seconds", 20))
+    ua = (config.get("http") or {}).get("user_agent") or DEFAULT_UA
+    accept = "application/rss+xml,application/atom+xml,application/xml;q=0.9,*/*;q=0.8"
+    try:
+        async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": ua, "Accept": accept}) as client:
+            body = await fetch_url(client, url, timeout=timeout, user_agent=ua, accept_header=accept)
+        items = parse_rss_items(monitor, body)
+        baseline_only = bool(monitor["baseline_on_first_run"]) and not monitor_has_state(name)
+        for item in items:
+            if not cn_biomed_item_is_recent(item, int(settings["max_age_hours"])):
+                continue
+            blocked, block_reason = item_blocked(item, monitor)
+            if blocked or not cn_biomed_source_allowed(item, feed):
+                should_notify_and_update(monitor, item, [])
+                logger.debug("CN biomed feed %s skipped %s: %s", name, item.title, block_reason or "source not allowed")
+                continue
+            hits = cn_biomed_keyword_hits(item, monitor["keywords"])
+            if monitor["keywords"] and not hits:
+                should_notify_and_update(monitor, item, [])
+                continue
+            reasons = should_notify_and_update(monitor, item, hits)
+            if baseline_only or not reasons:
+                continue
+            dedupe_key = reserve_cn_biomed_event(item, int(settings["dedupe_days"]))
+            if dedupe_key is None:
+                continue
+            title = cn_biomed_display_title(item.title, item.source or "")
+            if settings["translate_titles"]:
+                try:
+                    title = await translate_cn_biomed_title(title)
+                except Exception:
+                    logger.exception("CN biomed title translation failed: %s", item.title)
+            source = str(item.source or feed.get("name") or "-").strip()
+            text = (
+                f"来源：{html_escape(source)}\n"
+                f"标题：{html_escape(title)}\n"
+                f"链接：{html_escape(item.link)}"
+            )
+            if await send_cn_biomed_notification(text):
+                record_monitor_event(CN_BIOMED_STATE_PREFIX + source, title, item.link, reasons, True)
+                sent_count += 1
+            else:
+                release_cn_biomed_event(dedupe_key)
+        if baseline_only:
+            logger.info("CN biomed feed %s initialized baseline with %d parsed items", name, len(items))
+        record_monitor_runtime(name, True, int((time.time() - started) * 1000), sent_count)
+    except Exception as exc:
+        logger.exception("CN biomed feed failed: %s %s", name, url)
+        record_monitor_runtime(name, False, int((time.time() - started) * 1000), sent_count, str(exc))
+    return sent_count
+
+
 
 def cleanup_monitor_data(retention_minutes: int) -> tuple[int, int]:
     """Delete only website/RSS monitor state older than retention.
@@ -3489,8 +3929,18 @@ def cleanup_monitor_data(retention_minutes: int) -> tuple[int, int]:
     """
     cutoff_ts = time.time() - max(1, int(retention_minutes)) * 60
     cutoff = datetime.fromtimestamp(cutoff_ts, timezone.utc).astimezone().isoformat(timespec="seconds")
+    cn_cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=int(cn_biomed_settings()["dedupe_days"]))
+    ).astimezone().isoformat(timespec="seconds")
     with closing(db()) as conn:
-        cur1 = conn.execute("DELETE FROM monitor_state WHERE updated_at < ?", (cutoff,))
+        cur1 = conn.execute(
+            """
+            DELETE FROM monitor_state
+            WHERE (monitor_name != ? AND updated_at < ?)
+               OR (monitor_name = ? AND updated_at < ?)
+            """,
+            (CN_BIOMED_DEDUPE_STATE, cutoff, CN_BIOMED_DEDUPE_STATE, cn_cutoff),
+        )
         cur2 = conn.execute("DELETE FROM sent_events WHERE created_at < ?", (cutoff,))
         conn.commit()
         return int(cur1.rowcount or 0), int(cur2.rowcount or 0)
@@ -3586,6 +4036,16 @@ async def run_all_monitors_once() -> None:
     logger.info("manual/all monitor run done, notifications=%d", total)
 
 
+async def run_all_cn_biomed_once() -> int:
+    settings = cn_biomed_settings()
+    total = 0
+    for feed in settings["feeds"]:
+        if feed.get("enabled", True):
+            total += await run_cn_biomed_feed(feed)
+    logger.info("manual/all CN biomed feed run done, notifications=%d", total)
+    return total
+
+
 def schedule_monitors(scheduler: AsyncIOScheduler) -> None:
     for idx, m in enumerate(config.get("monitors") or []):
         name = m.get("name", "unnamed")
@@ -3600,6 +4060,31 @@ def schedule_monitors(scheduler: AsyncIOScheduler) -> None:
         job_key = stable_key(str(idx), name, m.get("url", ""))[:16]
         scheduler.add_job(run_monitor, "interval", seconds=interval, args=[m], id=f"monitor:{idx}:{job_key}", max_instances=1, coalesce=True, replace_existing=True, next_run_time=datetime.now(timezone.utc))
         logger.info("scheduled monitor %s every %ss", name, interval)
+
+
+def schedule_cn_biomed_feeds(scheduler: AsyncIOScheduler) -> None:
+    settings = cn_biomed_settings()
+    if not settings["enabled"] or not cn_biomed_bot_env_configured():
+        return
+    for idx, feed in enumerate(settings["feeds"]):
+        if not feed.get("enabled", True):
+            continue
+        name = str(feed.get("name") or "unnamed")
+        requested = safe_int(feed.get("interval_seconds"), DEFAULT_CN_BIOMED_INTERVAL_SECONDS)
+        interval = max(requested, MIN_INTERVAL_SECONDS)
+        job_key = stable_key(str(idx), name, str(feed.get("url") or ""))[:16]
+        scheduler.add_job(
+            run_cn_biomed_feed,
+            "interval",
+            seconds=interval,
+            args=[feed],
+            id=f"cn-biomed:{idx}:{job_key}",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+            next_run_time=datetime.now(timezone.utc),
+        )
+        logger.info("scheduled CN biomed feed %s every %ss", name, interval)
 
 
 
@@ -3722,6 +4207,13 @@ def env_values() -> dict[str, str]:
         "RELAY_BOT_TOKEN": os.getenv("RELAY_BOT_TOKEN", ""),
         "MONITOR_BOT_TOKEN": os.getenv("MONITOR_BOT_TOKEN", ""),
         "GROUP_BOT_TOKEN": os.getenv("GROUP_BOT_TOKEN", ""),
+        "CN_BIOMED_BOT_TOKEN": os.getenv("CN_BIOMED_BOT_TOKEN", ""),
+        "CN_BIOMED_CHAT_ID": os.getenv("CN_BIOMED_CHAT_ID", ""),
+        "CN_BIOMED_AI_BASE_URL": os.getenv("CN_BIOMED_AI_BASE_URL", ""),
+        "CN_BIOMED_AI_API_KEY": os.getenv("CN_BIOMED_AI_API_KEY", ""),
+        "CN_BIOMED_AI_MODEL": os.getenv("CN_BIOMED_AI_MODEL", "gpt-4o-mini"),
+        "CN_BIOMED_AI_INTERFACE": os.getenv("CN_BIOMED_AI_INTERFACE", "responses"),
+        "CN_BIOMED_AI_TIMEOUT_SECONDS": os.getenv("CN_BIOMED_AI_TIMEOUT_SECONDS", "30"),
         "MONITOR_READ_COMMAND": os.getenv("MONITOR_READ_COMMAND", "/r"),
         "RELAY_VERIFY_MODE": os.getenv("RELAY_VERIFY_MODE", "off"),
         "RELAY_VERIFY_TIMEOUT_SECONDS": os.getenv("RELAY_VERIFY_TIMEOUT_SECONDS", ""),
@@ -3806,6 +4298,15 @@ def write_env_values(values: dict[str, str]) -> None:
         f"RELAY_BOT_TOKEN={values.get('RELAY_BOT_TOKEN','')}",
         f"MONITOR_BOT_TOKEN={values.get('MONITOR_BOT_TOKEN','')}",
         f"GROUP_BOT_TOKEN={values.get('GROUP_BOT_TOKEN','')}",
+        "",
+        "# Independent IVD RSS delivery and title translation",
+        f"CN_BIOMED_BOT_TOKEN={values.get('CN_BIOMED_BOT_TOKEN', existing.get('CN_BIOMED_BOT_TOKEN',''))}",
+        f"CN_BIOMED_CHAT_ID={values.get('CN_BIOMED_CHAT_ID', existing.get('CN_BIOMED_CHAT_ID',''))}",
+        f"CN_BIOMED_AI_BASE_URL={values.get('CN_BIOMED_AI_BASE_URL', existing.get('CN_BIOMED_AI_BASE_URL',''))}",
+        f"CN_BIOMED_AI_API_KEY={values.get('CN_BIOMED_AI_API_KEY', existing.get('CN_BIOMED_AI_API_KEY',''))}",
+        f"CN_BIOMED_AI_MODEL={values.get('CN_BIOMED_AI_MODEL', existing.get('CN_BIOMED_AI_MODEL','gpt-4o-mini'))}",
+        f"CN_BIOMED_AI_INTERFACE={values.get('CN_BIOMED_AI_INTERFACE', existing.get('CN_BIOMED_AI_INTERFACE','responses'))}",
+        f"CN_BIOMED_AI_TIMEOUT_SECONDS={values.get('CN_BIOMED_AI_TIMEOUT_SECONDS', existing.get('CN_BIOMED_AI_TIMEOUT_SECONDS','30'))}",
         f"MONITOR_READ_COMMAND={values.get('MONITOR_READ_COMMAND','/r')}",
         f"RELAY_VERIFY_MODE={values.get('RELAY_VERIFY_MODE','off')}",
         f"RELAY_VERIFY_TIMEOUT_SECONDS={values.get('RELAY_VERIFY_TIMEOUT_SECONDS','')}",
@@ -3930,6 +4431,34 @@ def cfg_save(new_cfg: dict[str, Any]) -> None:
         if not isinstance(raw_excludes, list):
             raise ValueError("monitor.exclude_keywords 必须是列表或文本")
         m["exclude_keywords"] = [str(part).strip() for part in raw_excludes if str(part).strip()]
+    cn_raw = new_cfg.get("cn_biomed")
+    if cn_raw is not None:
+        if not isinstance(cn_raw, dict):
+            raise ValueError("cn_biomed 必须是对象")
+        cn_raw["enabled"] = bool(cn_raw.get("enabled", True))
+        cn_raw["translate_titles"] = bool(cn_raw.get("translate_titles", True))
+        cn_raw["max_age_hours"] = max(1, safe_int(cn_raw.get("max_age_hours"), DEFAULT_CN_BIOMED_MAX_AGE_HOURS))
+        cn_raw["dedupe_days"] = max(1, safe_int(cn_raw.get("dedupe_days"), DEFAULT_CN_BIOMED_DEDUPE_DAYS))
+        cn_feeds = cn_raw.setdefault("feeds", [])
+        if not isinstance(cn_feeds, list):
+            raise ValueError("cn_biomed.feeds 必须是列表")
+        for feed in cn_feeds:
+            if not isinstance(feed, dict):
+                raise ValueError("每个 IVD Feed 必须是对象")
+            if not str(feed.get("name") or "").strip() or not str(feed.get("url") or "").strip():
+                raise ValueError("IVD Feed 的名称和 URL 必填")
+            feed["name"] = str(feed["name"]).strip()
+            feed["url"] = str(feed["url"]).strip()
+            feed["enabled"] = bool(feed.get("enabled", True))
+            feed["baseline_on_first_run"] = bool(feed.get("baseline_on_first_run", True))
+            feed["interval_seconds"] = max(MIN_INTERVAL_SECONDS, safe_int(feed.get("interval_seconds"), DEFAULT_CN_BIOMED_INTERVAL_SECONDS))
+            for key in ("keywords", "exclude_keywords", "sources"):
+                values = feed.get(key) or []
+                if isinstance(values, str):
+                    values = [part.strip() for part in re.split(r"[\r\n,]+", values) if part.strip()]
+                if not isinstance(values, list):
+                    raise ValueError(f"IVD Feed 的 {key} 必须是列表或文本")
+                feed[key] = [str(part).strip() for part in values if str(part).strip()]
     group_monitor_rows = new_cfg.get("group_monitors") or []
     if group_monitor_rows is not None and not isinstance(group_monitor_rows, list):
         raise ValueError("group_monitors 必须是列表")
@@ -3977,9 +4506,10 @@ def cfg_save(new_cfg: dict[str, Any]) -> None:
 def reload_scheduler_jobs() -> None:
     if scheduler_ref:
         for job in list(scheduler_ref.get_jobs()):
-            if job.id.startswith("monitor:"):
+            if job.id.startswith("monitor:") or job.id.startswith("cn-biomed:"):
                 scheduler_ref.remove_job(job.id)
         schedule_monitors(scheduler_ref)
+        schedule_cn_biomed_feeds(scheduler_ref)
 
 
 def parse_lines(text: str) -> list[str]:
@@ -4117,6 +4647,31 @@ def monitor_from_form(
     return m
 
 
+def cn_biomed_feed_from_form(
+    name: str,
+    url: str,
+    interval_seconds: int,
+    keywords: str,
+    exclude_keywords: str,
+    sources: str,
+    enabled: bool,
+    baseline_on_first_run: bool,
+) -> dict[str, Any]:
+    feed = {
+        "name": name.strip(),
+        "url": url.strip(),
+        "enabled": enabled,
+        "interval_seconds": max(MIN_INTERVAL_SECONDS, int(interval_seconds or DEFAULT_CN_BIOMED_INTERVAL_SECONDS)),
+        "keywords": parse_lines(keywords),
+        "exclude_keywords": parse_lines(exclude_keywords),
+        "sources": parse_lines(sources),
+        "baseline_on_first_run": baseline_on_first_run,
+    }
+    if not feed["name"] or not feed["url"]:
+        raise ValueError("名称和 URL 必填")
+    return feed
+
+
 def layout(title: str, body: str) -> str:
     return f"""<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>
 <title>{html_escape(title)} · tg-watchbot</title>
@@ -4187,6 +4742,12 @@ table{{width:100%;border-collapse:collapse;border:3px solid var(--ink);backgroun
 td,th{{border:3px solid var(--ink);padding:10px;text-align:left;vertical-align:top}}
 th{{color:var(--ink);font-size:12px;background:var(--yellow);text-transform:uppercase;letter-spacing:.06em}}
 tr:nth-child(even) td{{background:#fafafa}}
+.table-scroll{{width:100%;overflow-x:auto;margin-top:16px}}
+.table-scroll table{{margin:0}}
+.cn-feed-table{{table-layout:fixed;min-width:900px}}
+.cn-feed-table td,.cn-history-table td{{overflow-wrap:anywhere;word-break:break-word}}
+.cn-feed-actions{{display:flex;gap:6px;align-items:flex-start;flex-wrap:wrap}}
+.cn-history-table{{table-layout:fixed;min-width:700px}}
 .badge{{padding:4px 8px;border:3px solid var(--ink);border-radius:999px;background:var(--blue);color:white;font-size:12px;font-weight:900;text-transform:uppercase}}
 .msg{{padding:11px 12px;border:3px solid var(--ink);background:var(--yellow);color:var(--ink);margin:10px 0;font-weight:900;box-shadow:4px 4px 0 var(--ink)}}
 pre{{white-space:pre-wrap;background:#121212;color:#fff;padding:13px;border:4px solid var(--ink);max-height:420px;overflow:auto;box-shadow:5px 5px 0 var(--yellow)}}
@@ -4211,7 +4772,7 @@ html[data-theme='dark'] pre{{background:#080a0d}}
 @media (prefers-reduced-motion: reduce){{
   *,*::before,*::after{{animation:none!important;transition:none!important}}
 }}
-</style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><section><b>消息</b><a href='/inbox'>收件箱</a><a href='/users'>用户管理</a><a href='/send'>主动发消息</a><a href='/replies'>快捷回复</a><a href='/rules'>私聊广告拦截</a></section><section><b>监控</b><a href='/'>监控面板</a><a href='/monitor/new'>新增监控</a><a href='/group-monitors'>TG 群监听</a><a href='/monitor/events'>推送历史</a><a href='/run-once'>手动检查</a></section><section><b>配置</b><a href='/settings'>Bot / 面板设置</a><a href='/forwarder'>TG 转发器</a><a href='/yaml'>YAML 高级编辑</a><a href='/config/export'>导出配置</a></section><section><b>系统</b><a href='/update'>更新代码</a><a href='/logs'>运行日志</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启机器人</a><a class=logout href='/logout'>退出登录</a></section></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><div class=top-actions><button class='btn theme-toggle' type=button data-theme-toggle onclick='toggleTheme()' aria-label='切换暗黑主题' title='切换暗黑主题'>暗</button><span class=badge>WatchBot Panel</span></div></div>
+</style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><section><b>消息</b><a href='/inbox'>收件箱</a><a href='/users'>用户管理</a><a href='/send'>主动发消息</a><a href='/replies'>快捷回复</a><a href='/rules'>私聊广告拦截</a></section><section><b>监控</b><a href='/'>监控面板</a><a href='/monitor/new'>新增监控</a><a href='/group-monitors'>TG 群监听</a><a href='/monitor/events'>推送历史</a><a href='/run-once'>手动检查</a><a href='/cn-biomed'>IVD 动态</a></section><section><b>配置</b><a href='/settings'>Bot / 面板设置</a><a href='/forwarder'>TG 转发器</a><a href='/yaml'>YAML 高级编辑</a><a href='/config/export'>导出配置</a></section><section><b>系统</b><a href='/update'>更新代码</a><a href='/logs'>运行日志</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启机器人</a><a class=logout href='/logout'>退出登录</a></section></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><div class=top-actions><button class='btn theme-toggle' type=button data-theme-toggle onclick='toggleTheme()' aria-label='切换暗黑主题' title='切换暗黑主题'>暗</button><span class=badge>WatchBot Panel</span></div></div>
 {body}<div class=friend-links><b>友链</b><a href='https://linux.do' target='_blank' rel='noopener noreferrer'>Linux.do</a><span>·</span><a href='https://www.nodeseek.com' target='_blank' rel='noopener noreferrer'>NodeSeek</a></div></main></div>{theme_interaction_script()}</body></html>"""
 
 
@@ -4246,6 +4807,32 @@ def monitor_form_html(m: dict[str, Any] | None = None, idx: int | None = None) -
 <label><input type=checkbox name=enabled {'checked' if m.get('enabled', True) else ''}> 启用监控</label>
 <label><input type=checkbox name=notify_telegram {'checked' if m.get('notify_telegram', True) else ''}> 推送 Telegram</label></div>
 <div class=form-actions><button class='btn primary' type=submit>保存</button> <a class=btn href='/'>取消</a></div></form>"""
+
+
+def cn_biomed_feed_form_html(feed: dict[str, Any] | None = None, idx: int | None = None) -> str:
+    feed = feed or {
+        "interval_seconds": DEFAULT_CN_BIOMED_INTERVAL_SECONDS,
+        "enabled": True,
+        "baseline_on_first_run": True,
+        "keywords": [],
+        "exclude_keywords": [],
+        "sources": [],
+    }
+    action = "/cn-biomed/feed/save" if idx is not None else "/cn-biomed/feed/create"
+    hidden = f"<input type=hidden name=original_index value='{idx}'>" if idx is not None else ""
+    keywords = "\n".join(feed.get("keywords") or [])
+    exclude_keywords = "\n".join(feed.get("exclude_keywords") or [])
+    sources = "\n".join(feed.get("sources") or [])
+    return f"""<form method=post action='{action}' class=card>{hidden}
+<div class=grid><div><label>来源名称</label><input name=name value='{html_escape(feed.get('name',''))}' required></div>
+<div><label>RSS / Atom URL</label><input name=url value='{html_escape(feed.get('url',''))}' required></div>
+<div><label>抓取间隔（秒）</label><input name=interval_seconds type=number min=60 value='{html_escape(feed.get('interval_seconds',DEFAULT_CN_BIOMED_INTERVAL_SECONDS))}'></div></div>
+<label>保留关键词（一行一个，为空则保留该来源全部条目）</label><textarea name=keywords>{html_escape(keywords)}</textarea>
+<label>屏蔽关键词（一行一个）</label><textarea name=exclude_keywords>{html_escape(exclude_keywords)}</textarea>
+<label>媒体来源白名单（一行一个，为空则不限制；主要用于 Google News）</label><textarea name=sources>{html_escape(sources)}</textarea>
+<div class=check-row><label><input type=checkbox name=enabled {'checked' if feed.get('enabled', True) else ''}> 启用来源</label>
+<label><input type=checkbox name=baseline_on_first_run {'checked' if feed.get('baseline_on_first_run', True) else ''}> 首次只建立基线</label></div>
+<div class=form-actions><button class='btn primary' type=submit>保存来源</button> <a class=btn href='/cn-biomed'>取消</a></div></form>"""
 
 
 def forwarder_form_html(values: dict[str, str]) -> str:
@@ -4437,6 +5024,214 @@ button[disabled]{{opacity:.45;cursor:not-allowed}}
             rows.append(f"""<tr><td><span class=badge>{html_escape(m.get('type','web'))}</span></td><td><b>{html_escape(name)}</b><br><small>{html_escape(m.get('url',''))}</small></td><td>{html_escape(m.get('interval_seconds',60))}s<br><small>{enabled_label} · {tg}</small></td><td>{include_text}<br><small>屏蔽：{exclude_text}</small></td><td>{st_line}</td><td><a class=btn href='/monitor/{i}/edit'>编辑</a> <a class='btn ok' href='/monitor/{i}/preview'>预览</a> <a class='btn ok' href='/monitor/{i}/run'>检查</a> <a class='btn danger' href='/monitor/{i}/delete' onclick='return confirm("确定删除？")'>删除</a></td></tr>""")
         body = f"""<div class=card><div class=toolbar><div><h2 style='margin:0 0 6px'>监控目标</h2><p class=muted style='margin:0'>当前 {len(cfg.get('monitors') or [])} 个；保存后自动重载定时任务。</p></div><div class=actions><a class='btn' href='/monitor/templates'>论坛模板</a> <a class='btn primary' href='/monitor/new'>新增监控</a> <a class='btn ok' href='/monitor/bulk'>批量新增</a></div></div><table style='margin-top:16px'><tr><th>类型</th><th>目标</th><th>间隔/通知</th><th>关键词</th><th>运行状态</th><th>操作</th></tr>""" + "".join(rows) + "</table></div>"
         return layout("监控", body)
+
+    @app.get("/cn-biomed", response_class=HTMLResponse)
+    async def cn_biomed_page(_: str = Depends(panel_auth)) -> str:
+        cfg = cfg_load_fresh()
+        settings = cn_biomed_settings(cfg)
+        values = env_values()
+        statuses = list_monitor_runtime_status()
+        ready = bool(values["CN_BIOMED_BOT_TOKEN"] and values["CN_BIOMED_CHAT_ID"])
+        status_text = "已配置，修改 Token 后需重启" if ready else "未完成独立 Bot Token / Chat ID 配置"
+        feed_rows: list[str] = []
+        for idx, feed in enumerate(settings["feeds"]):
+            name = str(feed.get("name") or "")
+            runtime = statuses.get(CN_BIOMED_STATE_PREFIX + name)
+            runtime_text = get_monitor_status_badge(runtime)
+            if runtime:
+                runtime_text += f" · {runtime.get('last_duration_ms', 0)}ms · 推送 {runtime.get('last_sent_count', 0)}"
+            feed_rows.append(
+                f"<tr><td><b>{html_escape(name)}</b><br><small>{html_escape(feed.get('url',''))}</small></td>"
+                f"<td>{'运行中' if feed.get('enabled', True) else '已停用'}<br><small>{html_escape(feed.get('interval_seconds', DEFAULT_CN_BIOMED_INTERVAL_SECONDS))}s</small></td>"
+                f"<td>{html_escape(', '.join(feed.get('keywords') or []) or '全部')}<br><small>来源：{html_escape(', '.join(feed.get('sources') or []) or '不限')}</small></td>"
+                f"<td>{html_escape(runtime_text)}</td><td><div class=cn-feed-actions><a class=btn href='/cn-biomed/feed/{idx}/edit'>编辑</a> "
+                f"<a class='btn ok' href='/cn-biomed/feed/{idx}/preview'>预览</a> "
+                f"<a class='btn ok' href='/cn-biomed/feed/{idx}/run'>检查</a> "
+                f"<a class='btn danger' href='/cn-biomed/feed/{idx}/delete' onclick='return confirm(\"确定删除？\")'>删除</a></div></td></tr>"
+            )
+        with closing(db()) as conn:
+            events = conn.execute(
+                "SELECT * FROM monitor_events WHERE monitor_name LIKE ? ORDER BY id DESC LIMIT 100",
+                (CN_BIOMED_STATE_PREFIX + "%",),
+            ).fetchall()
+        event_rows = "".join(
+            f"<tr><td>{html_escape(str(row['monitor_name'])[len(CN_BIOMED_STATE_PREFIX):])}</td>"
+            f"<td>{html_escape(row['title'])}<br><small>{html_escape(row['link'])}</small></td>"
+            f"<td>{html_escape(row['created_at'])}</td></tr>"
+            for row in events
+        )
+        body = f"""
+<div class=card><div class=toolbar><div><h2 style='margin:0 0 6px'>独立推送设置</h2><span class=badge>{html_escape(status_text)}</span></div></div>
+<form method=post action='/cn-biomed/settings'>
+<div class=grid><div><label>CN_BIOMED_BOT_TOKEN</label><input name=bot_token value='{html_escape(values['CN_BIOMED_BOT_TOKEN'])}'></div>
+<div><label>CN_BIOMED_CHAT_ID</label><input name=chat_id value='{html_escape(values['CN_BIOMED_CHAT_ID'])}' placeholder='数字 Chat ID'></div>
+<div><label>只抓取最近（小时）</label><input name=max_age_hours type=number min=1 value='{settings['max_age_hours']}'></div>
+<div><label>跨来源去重（天）</label><input name=dedupe_days type=number min=1 value='{settings['dedupe_days']}'></div></div>
+<h3>英文标题翻译</h3>
+<div class=grid><div><label>OpenAI 兼容 Base URL</label><input name=ai_base_url value='{html_escape(values['CN_BIOMED_AI_BASE_URL'])}' placeholder='https://api.openai.com/v1'></div>
+<div><label>API Key</label><input name=ai_api_key value='{html_escape(values['CN_BIOMED_AI_API_KEY'])}'></div>
+<div><label>模型</label><input name=ai_model value='{html_escape(values['CN_BIOMED_AI_MODEL'])}'></div>
+<div><label>接口</label><select name=ai_interface><option value=responses {'selected' if values['CN_BIOMED_AI_INTERFACE'] == 'responses' else ''}>Responses</option><option value=chat {'selected' if values['CN_BIOMED_AI_INTERFACE'] == 'chat' else ''}>Chat Completions</option></select></div>
+<div><label>超时（秒）</label><input name=ai_timeout_seconds type=number min=1 value='{html_escape(values['CN_BIOMED_AI_TIMEOUT_SECONDS'])}'></div></div>
+<div class=check-row><label><input type=checkbox name=enabled {'checked' if settings['enabled'] else ''}> 启用 IVD 动态</label>
+<label><input type=checkbox name=translate_titles {'checked' if settings['translate_titles'] else ''}> 英文标题翻译为中文</label></div>
+<div class=form-actions><button class='btn primary' type=submit>保存独立设置</button> <a class=btn href='/restart'>重启机器人</a></div></form></div>
+<div class=card><div class=toolbar><div><h2 style='margin:0 0 6px'>RSS 来源</h2><p class=muted style='margin:0'>当前 {len(settings['feeds'])} 个来源</p></div>
+<div class=actions><form method=post action='/cn-biomed/feeds/init' style='display:inline'><button class=btn type=submit>加入推荐来源</button></form> <a class='btn primary' href='/cn-biomed/feed/new'>新增来源</a> <a class='btn ok' href='/cn-biomed/run-once'>全部检查</a></div></div>
+<div class=table-scroll><table class=cn-feed-table><colgroup><col style='width:30%'><col style='width:11%'><col style='width:25%'><col style='width:18%'><col style='width:16%'></colgroup><tr><th>来源</th><th>状态/间隔</th><th>过滤</th><th>运行状态</th><th>操作</th></tr>{''.join(feed_rows)}</table></div></div>
+<div class=card><h2>最近推送</h2><div class=table-scroll><table class=cn-history-table><colgroup><col style='width:22%'><col style='width:58%'><col style='width:20%'></colgroup><tr><th>来源</th><th>标题/链接</th><th>时间</th></tr>{event_rows}</table></div></div>"""
+        return layout("IVD 动态", body)
+
+    @app.post("/cn-biomed/settings", response_class=HTMLResponse)
+    async def cn_biomed_settings_save(
+        _: str = Depends(panel_auth),
+        bot_token: str = Form(""),
+        chat_id: str = Form(""),
+        max_age_hours: int = Form(DEFAULT_CN_BIOMED_MAX_AGE_HOURS),
+        dedupe_days: int = Form(DEFAULT_CN_BIOMED_DEDUPE_DAYS),
+        ai_base_url: str = Form(""),
+        ai_api_key: str = Form(""),
+        ai_model: str = Form("gpt-4o-mini"),
+        ai_interface: str = Form("responses"),
+        ai_timeout_seconds: int = Form(30),
+        enabled: str | None = Form(None),
+        translate_titles: str | None = Form(None),
+    ) -> str:
+        try:
+            if chat_id.strip():
+                int(chat_id.strip())
+        except ValueError:
+            return HTMLResponse(layout("保存失败", "<div class=card>CN_BIOMED_CHAT_ID 必须是数字。</div>"), status_code=400)
+        values = env_values()
+        values.update(
+            {
+                "CN_BIOMED_BOT_TOKEN": bot_token.strip(),
+                "CN_BIOMED_CHAT_ID": chat_id.strip(),
+                "CN_BIOMED_AI_BASE_URL": ai_base_url.strip(),
+                "CN_BIOMED_AI_API_KEY": ai_api_key.strip(),
+                "CN_BIOMED_AI_MODEL": ai_model.strip() or "gpt-4o-mini",
+                "CN_BIOMED_AI_INTERFACE": ai_interface if ai_interface in {"responses", "chat"} else "responses",
+                "CN_BIOMED_AI_TIMEOUT_SECONDS": str(max(1, ai_timeout_seconds)),
+            }
+        )
+        write_env_values(values)
+        cfg = cfg_load_fresh()
+        section = cfg.setdefault("cn_biomed", {})
+        section["enabled"] = bool(enabled)
+        section["translate_titles"] = bool(translate_titles)
+        section["max_age_hours"] = max(1, max_age_hours)
+        section["dedupe_days"] = max(1, dedupe_days)
+        section.setdefault("feeds", [])
+        cfg_save(cfg)
+        return layout("已保存", "<div class=msg>IVD 动态设置已保存；Token 或 Chat ID 变更后请重启。</div><p><a class=btn href='/cn-biomed'>返回</a> <a class=btn href='/restart'>重启机器人</a></p>")
+
+    @app.post("/cn-biomed/feeds/init")
+    async def cn_biomed_feeds_init(_: str = Depends(panel_auth)) -> RedirectResponse:
+        cfg = cfg_load_fresh()
+        section = cfg.setdefault("cn_biomed", {})
+        feeds = section.setdefault("feeds", [])
+        existing_urls = {str(feed.get("url") or "") for feed in feeds if isinstance(feed, dict)}
+        feeds.extend(feed for feed in default_cn_biomed_feeds() if feed["url"] not in existing_urls)
+        section.setdefault("enabled", True)
+        section.setdefault("translate_titles", True)
+        section.setdefault("max_age_hours", DEFAULT_CN_BIOMED_MAX_AGE_HOURS)
+        section.setdefault("dedupe_days", DEFAULT_CN_BIOMED_DEDUPE_DAYS)
+        cfg_save(cfg)
+        return RedirectResponse("/cn-biomed", status_code=303)
+
+    @app.get("/cn-biomed/feed/new", response_class=HTMLResponse)
+    async def cn_biomed_feed_new(_: str = Depends(panel_auth)) -> str:
+        return layout("新增 IVD 来源", cn_biomed_feed_form_html())
+
+    @app.get("/cn-biomed/feed/{idx}/edit", response_class=HTMLResponse)
+    async def cn_biomed_feed_edit(idx: int, _: str = Depends(panel_auth)) -> str:
+        feeds = cn_biomed_settings(cfg_load_fresh())["feeds"]
+        if idx < 0 or idx >= len(feeds):
+            raise HTTPException(404, "feed not found")
+        return layout("编辑 IVD 来源", cn_biomed_feed_form_html(feeds[idx], idx))
+
+    async def save_cn_biomed_feed_common(
+        original_index: int | None,
+        name: str,
+        url: str,
+        interval_seconds: int,
+        keywords: str,
+        exclude_keywords: str,
+        sources: str,
+        enabled: str | None,
+        baseline_on_first_run: str | None,
+    ) -> RedirectResponse:
+        cfg = cfg_load_fresh()
+        section = cfg.setdefault("cn_biomed", {})
+        feeds = section.setdefault("feeds", [])
+        feed = cn_biomed_feed_from_form(
+            name, url, interval_seconds, keywords, exclude_keywords, sources, bool(enabled), bool(baseline_on_first_run)
+        )
+        if original_index is None:
+            feeds.append(feed)
+        elif 0 <= original_index < len(feeds):
+            feeds[original_index] = feed
+        else:
+            raise HTTPException(404, "feed not found")
+        cfg_save(cfg)
+        return RedirectResponse("/cn-biomed", status_code=303)
+
+    @app.post("/cn-biomed/feed/create")
+    async def cn_biomed_feed_create(_: str = Depends(panel_auth), name: str = Form(...), url: str = Form(...), interval_seconds: int = Form(DEFAULT_CN_BIOMED_INTERVAL_SECONDS), keywords: str = Form(""), exclude_keywords: str = Form(""), sources: str = Form(""), enabled: str | None = Form(None), baseline_on_first_run: str | None = Form(None)) -> RedirectResponse:
+        return await save_cn_biomed_feed_common(None, name, url, interval_seconds, keywords, exclude_keywords, sources, enabled, baseline_on_first_run)
+
+    @app.post("/cn-biomed/feed/save")
+    async def cn_biomed_feed_save(_: str = Depends(panel_auth), original_index: int = Form(...), name: str = Form(...), url: str = Form(...), interval_seconds: int = Form(DEFAULT_CN_BIOMED_INTERVAL_SECONDS), keywords: str = Form(""), exclude_keywords: str = Form(""), sources: str = Form(""), enabled: str | None = Form(None), baseline_on_first_run: str | None = Form(None)) -> RedirectResponse:
+        return await save_cn_biomed_feed_common(original_index, name, url, interval_seconds, keywords, exclude_keywords, sources, enabled, baseline_on_first_run)
+
+    @app.get("/cn-biomed/feed/{idx}/delete")
+    async def cn_biomed_feed_delete(idx: int, _: str = Depends(panel_auth)) -> RedirectResponse:
+        cfg = cfg_load_fresh()
+        feeds = (cfg.get("cn_biomed") or {}).get("feeds") or []
+        if 0 <= idx < len(feeds):
+            feeds.pop(idx)
+            cfg_save(cfg)
+        return RedirectResponse("/cn-biomed", status_code=303)
+
+    @app.get("/cn-biomed/feed/{idx}/preview", response_class=HTMLResponse)
+    async def cn_biomed_feed_preview(idx: int, _: str = Depends(panel_auth)) -> str:
+        cfg = cfg_load_fresh()
+        settings = cn_biomed_settings(cfg)
+        if idx < 0 or idx >= len(settings["feeds"]):
+            raise HTTPException(404, "feed not found")
+        feed = settings["feeds"][idx]
+        monitor = cn_biomed_monitor(feed)
+        timeout = int((cfg.get("http") or {}).get("timeout_seconds", 20))
+        ua = (cfg.get("http") or {}).get("user_agent") or DEFAULT_UA
+        try:
+            async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": ua}) as client:
+                raw = await fetch_url(client, monitor["url"], timeout=timeout, user_agent=ua)
+            items = parse_rss_items(monitor, raw)
+            rows: list[str] = []
+            for item in items[:30]:
+                recent = cn_biomed_item_is_recent(item, int(settings["max_age_hours"]))
+                blocked, reason = item_blocked(item, monitor)
+                source_ok = cn_biomed_source_allowed(item, feed)
+                hits = cn_biomed_keyword_hits(item, monitor["keywords"])
+                keyword_ok = not monitor["keywords"] or bool(hits)
+                state = "可推送" if recent and not blocked and source_ok and keyword_ok else reason or ("超过36小时/无有效时间" if not recent else "来源或关键词未通过")
+                rows.append(f"<tr><td>{html_escape(item.source or feed.get('name') or '-')}</td><td>{html_escape(item.title)}<br><small>{html_escape(item.link)}</small></td><td>{html_escape(item.published or '-')}</td><td>{html_escape(state)}</td></tr>")
+            return layout("IVD 来源预览", "<div class=card><table><tr><th>来源</th><th>标题/链接</th><th>发布时间</th><th>状态</th></tr>" + "".join(rows) + "</table></div>")
+        except Exception as exc:
+            return HTMLResponse(layout("预览失败", f"<div class=card><pre>{html_escape(exc)}</pre></div>"), status_code=500)
+
+    @app.get("/cn-biomed/feed/{idx}/run", response_class=HTMLResponse)
+    async def cn_biomed_feed_run(idx: int, _: str = Depends(panel_auth)) -> str:
+        feeds = cn_biomed_settings(cfg_load_fresh())["feeds"]
+        if idx < 0 or idx >= len(feeds):
+            raise HTTPException(404, "feed not found")
+        count = await run_cn_biomed_feed(feeds[idx])
+        return layout("检查完成", f"<div class=msg>已检查 {html_escape(feeds[idx].get('name'))}，推送 {count} 条。</div><p><a class=btn href='/cn-biomed'>返回</a></p>")
+
+    @app.get("/cn-biomed/run-once", response_class=HTMLResponse)
+    async def cn_biomed_run_once(_: str = Depends(panel_auth)) -> str:
+        count = await run_all_cn_biomed_once()
+        return layout("检查完成", f"<div class=msg>已检查全部 IVD 来源，推送 {count} 条。</div><p><a class=btn href='/cn-biomed'>返回</a></p>")
 
     @app.get("/monitor/new", response_class=HTMLResponse)
     async def new_monitor(_: str = Depends(panel_auth)) -> str:
@@ -5326,7 +6121,10 @@ async function logoutTgSession() {{
     @app.get("/monitor/events", response_class=HTMLResponse)
     async def monitor_events(_: str = Depends(panel_auth)) -> str:
         with closing(db()) as conn:
-            rows = conn.execute("SELECT * FROM monitor_events ORDER BY id DESC LIMIT 300").fetchall()
+            rows = conn.execute(
+                "SELECT * FROM monitor_events WHERE monitor_name NOT LIKE ? ORDER BY id DESC LIMIT 300",
+                (CN_BIOMED_STATE_PREFIX + "%",),
+            ).fetchall()
         trs = []
         for r in rows:
             status_txt = "已推 TG" if r["pushed"] else "仅 Web"
@@ -5535,19 +6333,26 @@ def validate_route_env() -> int:
 
 
 def bot_env_configured() -> bool:
-    return any([relay_bot_env_configured(), monitor_bot_env_configured(), group_bot_env_configured()])
+    return any(
+        [
+            relay_bot_env_configured(),
+            monitor_bot_env_configured(),
+            group_bot_env_configured(),
+            cn_biomed_bot_env_configured(),
+        ]
+    )
 
 
 def configured_bot_roles() -> list[str]:
     roles: list[str] = []
-    for role in [BOT_ROLE_RELAY, BOT_ROLE_MONITOR, BOT_ROLE_GROUP]:
+    for role in [BOT_ROLE_RELAY, BOT_ROLE_MONITOR, BOT_ROLE_GROUP, BOT_ROLE_CN_BIOMED]:
         if role_env_configured(role):
             roles.append(role)
     return roles
 
 
 def init_runtime_bots() -> list[Bot]:
-    global bot, monitor_bot, group_bot, admin_chat_id, admin_chat_ids
+    global bot, monitor_bot, group_bot, cn_biomed_bot, admin_chat_id, admin_chat_ids
     admin_chat_ids = parse_admin_chat_ids(os.getenv("ADMIN_CHAT_ID", ""))
     admin_chat_id = validate_route_env() if notification_route_configured() else None
     shared: dict[str, Bot] = {}
@@ -5555,6 +6360,7 @@ def init_runtime_bots() -> list[Bot]:
         BOT_ROLE_RELAY: None,
         BOT_ROLE_MONITOR: None,
         BOT_ROLE_GROUP: None,
+        BOT_ROLE_CN_BIOMED: None,
     }
     for role in configured_bot_roles():
         token = role_bot_token(role)
@@ -5566,6 +6372,7 @@ def init_runtime_bots() -> list[Bot]:
     bot = role_clients[BOT_ROLE_RELAY]
     monitor_bot = role_clients[BOT_ROLE_MONITOR]
     group_bot = role_clients[BOT_ROLE_GROUP]
+    cn_biomed_bot = role_clients[BOT_ROLE_CN_BIOMED]
     return list(shared.values())
 
 
@@ -5590,7 +6397,7 @@ async def run_polling_for_bot(client: Bot) -> None:
 
 
 async def main_async(run_once: bool = False, panel_only: bool = False) -> None:
-    global bot, monitor_bot, group_bot, admin_chat_id, admin_chat_ids, config, scheduler_ref, user_session_listener_task
+    global bot, monitor_bot, group_bot, cn_biomed_bot, admin_chat_id, admin_chat_ids, config, scheduler_ref, user_session_listener_task
     load_dotenv(ENV_PATH, override=True)
     config = load_config()
     setup_logging(os.getenv("LOG_LEVEL", "INFO"))
@@ -5621,6 +6428,7 @@ async def main_async(run_once: bool = False, panel_only: bool = False) -> None:
     scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
     scheduler_ref = scheduler
     schedule_monitors(scheduler)
+    schedule_cn_biomed_feeds(scheduler)
     scheduler.start()
     if role_env_configured(BOT_ROLE_RELAY):
         asyncio.create_task(flush_pending_loop())

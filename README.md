@@ -19,6 +19,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 普通用户私聊 Bot，消息会转发给管理员，或转发到私有超级群的 Forum Topic；
 - 管理员可以直接回复、主动发文字/图片、并通过“回复用户消息”回传文字、图片、文件、视频等常见媒体；
 - 后台定时监控 RSS 或网页，命中关键词、新条目、价格/库存变化后推送给管理员；
+- 现有面板“监控”菜单中的 IVD 动态栏目使用专用 Bot 和 Chat ID，过滤最近 36 小时的国内外体外诊断进展并把英文标题翻译为中文；
 - 支持把双向机器人、监控推送、群监听拆成 3 个独立 Bot，也支持共用同一个 Bot Token；
 - 用户会话支持面板二维码登录、登录状态、登出和 `TG_PROXY`，无需手工生成 StringSession；
 - 支持把 [TelegramForwarder](https://github.com/Heavrnl/TelegramForwarder) 作为可选子服务接入，保留其完整转发能力；
@@ -148,6 +149,17 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 - 主动发消息页面 `/send`，发送成功后会在页面显示结果，并给管理员聊天发送确认提醒。
 - 自动清理监控/RSS/网站状态数据；支持定时删除 Telegram 监控通知消息；删除模式可选“发送后倒计时”或“标记已读后倒计时”；不会删除用户、收件箱、双向对话消息。
 - 日志页面和健康检查 `/health`。
+
+### IVD 动态 RSS
+
+- 从现有面板“监控”菜单的最后一项进入 IVD 动态栏目，集中管理专用 Bot Token、Chat ID、标题翻译接口和 RSS 来源。
+- 与普通 Web/RSS 监控分开调度和展示；每个新条目单独推送，格式为来源、标题、链接。
+- 只处理发布时间在最近 36 小时内的条目；缺少有效发布时间的条目不会推送。
+- 英文标题通过可配置的 OpenAI 兼容接口翻译为简体中文；未配置或调用失败时保留英文标题，避免漏报。
+- Google News 分为中国 IVD、国内重点厂家、国际 IVD 和国外重点厂家四个查询 Feed；默认不设置媒体白名单，依靠查询词、IVD 关键词和行情屏蔽词过滤。
+- 相同标题在不同 Feed 或转载来源之间保留 10 天去重记录。
+- IVD 通知不会进入 Telegram 定时删除队列。
+- 补充原生源包括 BD 官方新闻和 MedTech Dive；不再接入创新药、BioWorld 药物栏目或综合健康资讯。
 
 ![示例图片](https://pic.gongyichuren.de/file/1779345259571_image.png)
 ![新版面板截图](https://pic.gongyichuren.de/file/1779437104636_image.png)
@@ -431,6 +443,13 @@ curl http://127.0.0.1:8765/health
 | `RELAY_BOT_TOKEN` | （可选）双向机器人专用 Token；留空则继承 `TELEGRAM_BOT_TOKEN` |
 | `MONITOR_BOT_TOKEN` | （可选）监控推送专用 Token；留空则继承 `TELEGRAM_BOT_TOKEN` |
 | `GROUP_BOT_TOKEN` | （可选）TG 群监听专用 Token；留空则继承 `TELEGRAM_BOT_TOKEN` |
+| `CN_BIOMED_BOT_TOKEN` | IVD 动态推送专用 Token；沿用原变量名且不继承共享 Token |
+| `CN_BIOMED_CHAT_ID` | IVD 动态推送的独立数字 Chat ID；沿用原变量名 |
+| `CN_BIOMED_AI_BASE_URL` | 标题翻译使用的 OpenAI 兼容 Base URL |
+| `CN_BIOMED_AI_API_KEY` | 标题翻译 API Key |
+| `CN_BIOMED_AI_MODEL` | 标题翻译模型，默认 `gpt-4o-mini` |
+| `CN_BIOMED_AI_INTERFACE` | 标题翻译接口：`responses` 或 `chat` |
+| `CN_BIOMED_AI_TIMEOUT_SECONDS` | 标题翻译请求超时，默认 `30` 秒 |
 | `MONITOR_READ_COMMAND` | 监控已读快捷命令，默认 `/r` |
 | `RELAY_VERIFY_MODE` | 新用户验证模式：`off` / `math` / `sticker` / `turnstile` |
 | `RELAY_VERIFY_TIMEOUT_SECONDS` | 验证超时时间；留空时本地验证默认 `180` 秒，Turnstile 默认 `600` 秒 |
@@ -657,6 +676,11 @@ monitors:
 | `/rules` | 私聊广告拦截规则 |
 | `/replies` | 快捷回复模板 |
 | `/monitor/events` | 监控推送历史 |
+| `/cn-biomed` | IVD 动态独立设置、RSS 管理和推送历史（兼容保留原路径） |
+| `/cn-biomed/feed/new` | 新增 IVD RSS 来源 |
+| `/cn-biomed/feed/{idx}/preview` | 预览来源及 36 小时、关键词、媒体白名单过滤结果 |
+| `/cn-biomed/feed/{idx}/run` | 手动检查单个 IVD 来源 |
+| `/cn-biomed/run-once` | 手动检查全部 IVD 来源 |
 | `/config/export` | 导出 / 导入 `config.yaml` |
 | `/logs` | 日志 |
 | `/health` | 健康检查 |
