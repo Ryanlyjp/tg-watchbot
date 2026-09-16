@@ -50,19 +50,141 @@ class CnBiomedTest(unittest.TestCase):
         feeds = app.default_cn_biomed_feeds()
         urls = {feed["url"] for feed in feeds}
         names = {feed["name"] for feed in feeds}
-        self.assertEqual(6, len(feeds))
+        self.assertEqual(8, len(feeds))
         self.assertIn("Google News 中国 IVD", names)
         self.assertIn("Google News 中国 IVD 厂家", names)
         self.assertIn("Google News 国际 IVD", names)
         self.assertIn("Google News 国际 IVD 厂家", names)
         self.assertIn("https://investors.bd.com/news-events/press-releases/rss", urls)
         self.assertIn("https://www.medtechdive.com/feeds/news/", urls)
+        self.assertIn(app.CMDE_HOME_URL, urls)
+        self.assertIn(app.CNINFO_ANNOUNCEMENT_URL, urls)
+        cmde = next(feed for feed in feeds if feed.get("source_type") == "cmde")
+        cninfo = next(feed for feed in feeds if feed.get("source_type") == "cninfo")
+        self.assertEqual(14, len(cninfo["companies"]))
+        self.assertEqual("迈瑞医疗", cninfo["companies"][0]["name"])
         self.assertNotIn("https://www.medicaldevice-network.com/feed/", urls)
         self.assertFalse(any("bioworld.com" in url or "chinanews.com.cn" in url for url in urls))
         self.assertTrue(all(feed["sources"] == [] for feed in feeds))
         self.assertTrue(all("创新药" not in feed["keywords"] for feed in feeds))
-        self.assertTrue(all(feed["baseline_on_first_run"] is False for feed in feeds))
+        self.assertTrue(all(feed["baseline_on_first_run"] is False for feed in feeds if feed.get("source_type", "rss") == "rss"))
+        self.assertTrue(cmde["baseline_on_first_run"])
+        self.assertTrue(cninfo["baseline_on_first_run"])
         self.assertTrue(all("when%3A1d" in url for url in urls if "news.google.com" in url))
+
+    def test_cmde_rendered_html_is_parsed_with_link_timestamp(self) -> None:
+        body = """
+        <div class="text clearfix">
+          <a href="xwdt/zxyw/20260916105408164.html"
+             title="关于体外诊断试剂注册审查指导原则的通知">截断标题...</a>
+          <span class="date fl-r">2026-09-16</span>
+        </div>
+        <div class="text clearfix">
+          <a href="xwdt/zxyw/20260916105408164.html" title="重复条目">重复条目</a>
+          <span class="date fl-r">2026-09-16</span>
+        </div>
+        """.encode()
+        items = app.parse_cmde_items(body)
+        self.assertEqual(1, len(items))
+        self.assertEqual("关于体外诊断试剂注册审查指导原则的通知", items[0].title)
+        self.assertEqual("CMDE 器审中心", items[0].source)
+        self.assertEqual("https://www.cmde.org.cn/xwdt/zxyw/20260916105408164.html", items[0].link)
+        self.assertEqual(datetime(2026, 9, 16, 2, 54, 8, tzinfo=timezone.utc), datetime.fromisoformat(items[0].published))
+
+    def test_cmde_source_uses_existing_flaresolverr_client(self) -> None:
+        body = """
+        <div class="text clearfix">
+          <a href="xwdt/zxyw/20260916105408164.html" title="体外诊断通知">体外诊断通知</a>
+        </div>
+        """.encode()
+        feed = {"source_type": "cmde", "url": app.CMDE_HOME_URL}
+        monitor = app.cn_biomed_monitor(feed)
+        fetch = AsyncMock(return_value=body)
+        with patch.object(app, "fetch_url_via_flaresolverr", new=fetch):
+            items = asyncio.run(app.fetch_cn_biomed_items(SimpleNamespace(), feed, monitor, 20, app.DEFAULT_UA))
+        self.assertEqual(1, len(items))
+        fetch.assert_awaited_once_with(
+            app.CMDE_HOME_URL,
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            rendered_html=True,
+        )
+
+    def test_cninfo_company_lines_round_trip(self) -> None:
+        text = "迈瑞医疗|300760|9900035304|szse|sz\n安图生物|603658|9900026792|sse|sh"
+        companies = app.parse_cninfo_company_lines(text)
+        self.assertEqual("9900035304", companies[0]["org_id"])
+        self.assertEqual(text, app.format_cninfo_company_lines(companies))
+        with self.assertRaisesRegex(ValueError, "格式必须"):
+            app.parse_cninfo_company_lines("迈瑞医疗|300760")
+
+    def test_cninfo_announcements_are_converted_to_monitor_items(self) -> None:
+        published = datetime(2026, 9, 15, 8, tzinfo=timezone.utc)
+        payload = {
+            "announcements": [
+                {
+                    "announcementId": "12345",
+                    "announcementTitle": "关于产品获得<em>医疗器械注册证</em>的公告",
+                    "announcementTime": int(published.timestamp() * 1000),
+                }
+            ]
+        }
+        company = app.DEFAULT_CNINFO_IVD_COMPANIES[0]
+        item = app.parse_cninfo_announcements(payload, company)[0]
+        self.assertEqual("关于产品获得 医疗器械注册证 的公告", item.title)
+        self.assertEqual("巨潮资讯 · 迈瑞医疗", item.source)
+        self.assertEqual(published, datetime.fromisoformat(item.published))
+        self.assertIn("announcementId=12345", item.link)
+        self.assertIn("stockCode=300760", item.link)
+
+    def test_cninfo_retries_one_transient_server_error(self) -> None:
+        class Response:
+            def __init__(self, status_code: int):
+                self.status_code = status_code
+
+            def raise_for_status(self) -> None:
+                if self.status_code >= 400:
+                    raise RuntimeError(str(self.status_code))
+
+            def json(self) -> dict:
+                return {"announcements": []}
+
+        client = SimpleNamespace(post=AsyncMock(side_effect=[Response(502), Response(200)]))
+        feed = {
+            "url": app.CNINFO_ANNOUNCEMENT_URL,
+            "companies": [app.DEFAULT_CNINFO_IVD_COMPANIES[0]],
+        }
+        self.assertEqual([], asyncio.run(app.fetch_cninfo_items(client, feed)))
+        self.assertEqual(2, client.post.await_count)
+
+    def test_cninfo_item_uses_existing_ivd_pipeline(self) -> None:
+        item = app.MonitorItem(
+            key="announcement-1",
+            title="关于产品获得医疗器械注册证的公告",
+            link="https://www.cninfo.com.cn/new/disclosure/detail?id=1",
+            text="科华生物 关于产品获得医疗器械注册证的公告",
+            published=datetime.now(timezone.utc).isoformat(),
+            source="巨潮资讯 · 科华生物",
+        )
+        feed = {
+            "name": "巨潮 IVD 厂商公告",
+            "source_type": "cninfo",
+            "url": app.CNINFO_ANNOUNCEMENT_URL,
+            "enabled": True,
+            "baseline_on_first_run": False,
+            "keywords": ["医疗器械注册证"],
+            "exclude_keywords": [],
+            "sources": [],
+            "companies": [app.DEFAULT_CNINFO_IVD_COMPANIES[10]],
+        }
+        send = AsyncMock(return_value=True)
+        with patch.object(app, "cn_biomed_bot_env_configured", return_value=True), patch.object(
+            app, "fetch_cn_biomed_items", new=AsyncMock(return_value=[item])
+        ), patch.object(app, "send_cn_biomed_notification", new=send):
+            self.assertEqual(1, asyncio.run(app.run_cn_biomed_feed(feed)))
+        self.assertEqual(
+            "来源：巨潮资讯 · 科华生物\n标题：关于产品获得医疗器械注册证的公告\n链接：https://www.cninfo.com.cn/new/disclosure/detail?id=1",
+            send.await_args.args[0],
+        )
 
     def test_google_news_source_is_parsed(self) -> None:
         body = feed_bytes(

@@ -188,6 +188,39 @@ cn_biomed:
     exclude_keywords: []
     sources: []
     baseline_on_first_run: false
+  - name: CMDE 器审中心 IVD
+    source_type: cmde
+    url: https://www.cmde.org.cn/
+    enabled: true
+    interval_seconds: 1800
+    keywords: [体外诊断, IVD, 分子诊断, POCT, 即时检测, 伴随诊断, 液体活检, 诊断试剂, 检测试剂, 诊断仪器, 免疫诊断, 生化诊断, 病理诊断, 核酸检测, 检测试剂盒, 基因检测, 测序, 免疫分析, 病理]
+    exclude_keywords: [ETF, 基金, 份额, 重仓股, 股价异动, 主力资金, 融资融券, 融资净, 大宗交易, 股东减持, 股票行情]
+    sources: []
+    baseline_on_first_run: true
+  - name: 巨潮 IVD 厂商公告
+    source_type: cninfo
+    url: https://www.cninfo.com.cn/new/hisAnnouncement/query
+    enabled: true
+    interval_seconds: 1800
+    keywords: [体外诊断, IVD, 分子诊断, POCT, 即时检测, 伴随诊断, 液体活检, 诊断试剂, 检测试剂, 诊断仪器, 免疫诊断, 生化诊断, 病理诊断, 核酸检测, 医疗器械注册证, 注册证, 试剂盒, IVDR, CE认证, 510(k), 获批, 获证, 召回, 行政处罚]
+    exclude_keywords: [ETF, 基金, 份额, 重仓股, 股价异动, 主力资金, 融资融券, 融资净, 大宗交易, 股东减持, 股票行情]
+    sources: []
+    companies:
+    - {name: 迈瑞医疗, code: '300760', org_id: '9900035304', column: szse, plate: sz}
+    - {name: 安图生物, code: '603658', org_id: '9900026792', column: sse, plate: sh}
+    - {name: 新产业, code: '300832', org_id: '9900027265', column: szse, plate: sz}
+    - {name: 迈克生物, code: '300463', org_id: '9900024338', column: szse, plate: sz}
+    - {name: 万孚生物, code: '300482', org_id: '9900024914', column: szse, plate: sz}
+    - {name: 圣湘生物, code: '688289', org_id: nssc1000305, column: sse, plate: sh}
+    - {name: 达安基因, code: '002030', org_id: gssz0002030, column: szse, plate: sz}
+    - {name: 迪瑞医疗, code: '300396', org_id: '9900022681', column: szse, plate: sz}
+    - {name: 东方生物, code: '688298', org_id: '9900039348', column: sse, plate: sh}
+    - {name: 亚辉龙, code: '688575', org_id: nssc1000247, column: sse, plate: sh}
+    - {name: 科华生物, code: '002022', org_id: gssz0002022, column: szse, plate: sz}
+    - {name: 基蛋生物, code: '603387', org_id: '9900031490', column: sse, plate: sh}
+    - {name: 艾德生物, code: '300685', org_id: '9900031703', column: szse, plate: sz}
+    - {name: 华大基因, code: '300676', org_id: '9900031781', column: szse, plate: sz}
+    baseline_on_first_run: true
 cleanup:
   enabled: true
   interval_minutes: 60

@@ -30,7 +30,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import quote_plus, unquote, urljoin, urlparse
+from urllib.parse import quote_plus, unquote, urlencode, urljoin, urlparse
 
 import feedparser
 import httpx
@@ -178,6 +178,8 @@ CN_BIOMED_DEDUPE_STATE = "__cn_biomed_dedupe__"
 DEFAULT_CN_BIOMED_MAX_AGE_HOURS = 36
 DEFAULT_CN_BIOMED_DEDUPE_DAYS = 10
 DEFAULT_CN_BIOMED_INTERVAL_SECONDS = 600
+CNINFO_ANNOUNCEMENT_URL = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
+CMDE_HOME_URL = "https://www.cmde.org.cn/"
 
 DEFAULT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -251,6 +253,23 @@ DEFAULT_IVD_EXCLUDE_KEYWORDS = [
     "大宗交易",
     "股东减持",
     "股票行情",
+]
+
+DEFAULT_CNINFO_IVD_COMPANIES = [
+    {"name": "迈瑞医疗", "code": "300760", "org_id": "9900035304", "column": "szse", "plate": "sz"},
+    {"name": "安图生物", "code": "603658", "org_id": "9900026792", "column": "sse", "plate": "sh"},
+    {"name": "新产业", "code": "300832", "org_id": "9900027265", "column": "szse", "plate": "sz"},
+    {"name": "迈克生物", "code": "300463", "org_id": "9900024338", "column": "szse", "plate": "sz"},
+    {"name": "万孚生物", "code": "300482", "org_id": "9900024914", "column": "szse", "plate": "sz"},
+    {"name": "圣湘生物", "code": "688289", "org_id": "nssc1000305", "column": "sse", "plate": "sh"},
+    {"name": "达安基因", "code": "002030", "org_id": "gssz0002030", "column": "szse", "plate": "sz"},
+    {"name": "迪瑞医疗", "code": "300396", "org_id": "9900022681", "column": "szse", "plate": "sz"},
+    {"name": "东方生物", "code": "688298", "org_id": "9900039348", "column": "sse", "plate": "sh"},
+    {"name": "亚辉龙", "code": "688575", "org_id": "nssc1000247", "column": "sse", "plate": "sh"},
+    {"name": "科华生物", "code": "002022", "org_id": "gssz0002022", "column": "szse", "plate": "sz"},
+    {"name": "基蛋生物", "code": "603387", "org_id": "9900031490", "column": "sse", "plate": "sh"},
+    {"name": "艾德生物", "code": "300685", "org_id": "9900031703", "column": "szse", "plate": "sz"},
+    {"name": "华大基因", "code": "300676", "org_id": "9900031781", "column": "szse", "plate": "sz"},
 ]
 
 
@@ -348,6 +367,30 @@ def default_cn_biomed_feeds() -> list[dict[str, Any]]:
             "exclude_keywords": list(DEFAULT_IVD_EXCLUDE_KEYWORDS),
             "sources": [],
             "baseline_on_first_run": False,
+        },
+        {
+            "name": "CMDE 器审中心 IVD",
+            "source_type": "cmde",
+            "url": CMDE_HOME_URL,
+            "enabled": True,
+            "interval_seconds": 1800,
+            "keywords": list(DEFAULT_IVD_KEYWORDS) + ["检测试剂盒", "基因检测", "测序", "免疫分析", "病理"],
+            "exclude_keywords": list(DEFAULT_IVD_EXCLUDE_KEYWORDS),
+            "sources": [],
+            "baseline_on_first_run": True,
+        },
+        {
+            "name": "巨潮 IVD 厂商公告",
+            "source_type": "cninfo",
+            "url": CNINFO_ANNOUNCEMENT_URL,
+            "enabled": True,
+            "interval_seconds": 1800,
+            "keywords": list(DEFAULT_IVD_KEYWORDS)
+            + ["医疗器械注册证", "注册证", "试剂盒", "IVDR", "CE认证", "510(k)", "获批", "获证", "召回", "行政处罚"],
+            "exclude_keywords": list(DEFAULT_IVD_EXCLUDE_KEYWORDS),
+            "sources": [],
+            "companies": [dict(company) for company in DEFAULT_CNINFO_IVD_COMPANIES],
+            "baseline_on_first_run": True,
         },
     ]
 
@@ -3281,7 +3324,7 @@ def unwrap_flaresolverr_rss(body: str) -> bytes:
     raise RuntimeError("Flaresolverr returned a browser page instead of RSS XML")
 
 
-async def fetch_url_via_flaresolverr(url: str, accept_header: str) -> bytes:
+async def fetch_url_via_flaresolverr(url: str, accept_header: str, rendered_html: bool = False) -> bytes:
     payload = {
         "cmd": "request.get",
         "url": url,
@@ -3294,8 +3337,9 @@ async def fetch_url_via_flaresolverr(url: str, accept_header: str) -> bytes:
     result = response.json()
     solution = result.get("solution") or {}
     if result.get("status") != "ok" or int(solution.get("status") or 0) != 200:
-        raise RuntimeError("Flaresolverr could not fetch the IDCFLARE RSS feed")
-    return unwrap_flaresolverr_rss(str(solution.get("response") or ""))
+        raise RuntimeError("Flaresolverr could not fetch the requested URL")
+    body = str(solution.get("response") or "")
+    return body.encode("utf-8") if rendered_html else unwrap_flaresolverr_rss(body)
 
 
 async def fetch_url(
@@ -3446,6 +3490,141 @@ def parse_rss_items(monitor: dict[str, Any], body: str | bytes) -> list[MonitorI
         detail = str(getattr(feed, "bozo_exception", "") or "").strip()
         raise ValueError(f"RSS/Atom 未解析到任何条目{': ' + detail if detail else ''}")
     return items
+
+
+def parse_cninfo_announcements(payload: dict[str, Any], company: dict[str, str]) -> list[MonitorItem]:
+    announcements = payload.get("announcements")
+    if not isinstance(announcements, list):
+        raise ValueError("巨潮接口未返回公告列表")
+    items: list[MonitorItem] = []
+    for announcement in announcements:
+        if not isinstance(announcement, dict):
+            continue
+        title = BeautifulSoup(str(announcement.get("announcementTitle") or ""), "html.parser").get_text(" ", strip=True)
+        announcement_id = str(announcement.get("announcementId") or "").strip()
+        timestamp_ms = safe_int(announcement.get("announcementTime"), 0)
+        if not title or timestamp_ms <= 0:
+            continue
+        published = datetime.fromtimestamp(timestamp_ms / 1000, timezone.utc)
+        published_date = published.astimezone(timezone(timedelta(hours=8))).date().isoformat()
+        params = urlencode(
+            {
+                "plate": company["plate"],
+                "orgId": company["org_id"],
+                "stockCode": company["code"],
+                "announcementId": announcement_id,
+                "announcementTime": published_date,
+            }
+        )
+        company_name = str(company["name"])
+        source = f"巨潮资讯 · {company_name}"
+        items.append(
+            MonitorItem(
+                key=announcement_id or stable_key(company["code"], title, str(timestamp_ms)),
+                title=title,
+                link=f"https://www.cninfo.com.cn/new/disclosure/detail?{params}",
+                text=f"{company_name} {title}",
+                published=published.isoformat(),
+                category=company_name,
+                source=source,
+            )
+        )
+    return items
+
+
+def parse_cmde_items(body: str | bytes, url: str = CMDE_HOME_URL) -> list[MonitorItem]:
+    soup = BeautifulSoup(body, "html.parser")
+    items: list[MonitorItem] = []
+    seen_links: set[str] = set()
+    china_tz = timezone(timedelta(hours=8))
+    for node in soup.select("div.text"):
+        link_node = node.select_one("a[href]")
+        if link_node is None:
+            continue
+        link = urljoin(url, str(link_node.get("href") or "").strip())
+        timestamp_match = re.search(r"/(\d{14})\d*\.html(?:$|[?#])", link)
+        if not link or link in seen_links or timestamp_match is None:
+            continue
+        title = str(link_node.get("title") or "").strip() or link_node.get_text(" ", strip=True)
+        if not title:
+            continue
+        published = datetime.strptime(timestamp_match.group(1), "%Y%m%d%H%M%S").replace(tzinfo=china_tz)
+        seen_links.add(link)
+        items.append(
+            MonitorItem(
+                key=stable_key(link),
+                title=title,
+                link=link,
+                text=node.get_text(" ", strip=True),
+                published=published.astimezone(timezone.utc).isoformat(),
+                source="CMDE 器审中心",
+            )
+        )
+    if not items:
+        raise ValueError("CMDE 页面未解析到带发布时间的条目")
+    items.sort(key=lambda item: str(item.published or ""), reverse=True)
+    return items
+
+
+async def fetch_cninfo_items(client: httpx.AsyncClient, feed: dict[str, Any]) -> list[MonitorItem]:
+    items: list[MonitorItem] = []
+    for company in feed.get("companies") or []:
+        stock_code = str(company.get("code") or "").strip()
+        org_id = str(company.get("org_id") or "").strip()
+        request_data = {
+            "stock": f"{stock_code},{org_id}",
+            "tabName": "fulltext",
+            "pageSize": "30",
+            "pageNum": "1",
+            "column": str(company.get("column") or ""),
+            "category": "",
+            "plate": str(company.get("plate") or ""),
+            "seDate": "",
+            "searchkey": "",
+            "secid": "",
+            "sortName": "",
+            "sortType": "",
+            "isHLtitle": "true",
+        }
+        request_headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Referer": f"https://www.cninfo.com.cn/new/disclosure/stock?stockCode={stock_code}&orgId={org_id}",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        for attempt in range(2):
+            response = await client.post(
+                str(feed.get("url") or CNINFO_ANNOUNCEMENT_URL),
+                data=request_data,
+                headers=request_headers,
+            )
+            if response.status_code < 500 or attempt == 1:
+                break
+        response.raise_for_status()
+        items.extend(parse_cninfo_announcements(response.json(), company))
+    items.sort(key=lambda item: str(item.published or ""), reverse=True)
+    return items
+
+
+async def fetch_cn_biomed_items(
+    client: httpx.AsyncClient,
+    feed: dict[str, Any],
+    monitor: dict[str, Any],
+    timeout: int,
+    user_agent: str,
+) -> list[MonitorItem]:
+    source_type = str(feed.get("source_type") or "rss")
+    if source_type == "cninfo":
+        return await fetch_cninfo_items(client, feed)
+    if source_type == "cmde":
+        body = await fetch_url_via_flaresolverr(
+            monitor["url"],
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            rendered_html=True,
+        )
+        return parse_cmde_items(body, monitor["url"])
+    accept = "application/rss+xml,application/atom+xml,application/xml;q=0.9,*/*;q=0.8"
+    body = await fetch_url(client, monitor["url"], timeout=timeout, user_agent=user_agent, accept_header=accept)
+    return parse_rss_items(monitor, body)
 
 
 def monitor_has_state(monitor_name: str) -> bool:
@@ -3871,11 +4050,9 @@ async def run_cn_biomed_feed(feed: dict[str, Any]) -> int:
         return 0
     timeout = int((config.get("http") or {}).get("timeout_seconds", 20))
     ua = (config.get("http") or {}).get("user_agent") or DEFAULT_UA
-    accept = "application/rss+xml,application/atom+xml,application/xml;q=0.9,*/*;q=0.8"
     try:
-        async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": ua, "Accept": accept}) as client:
-            body = await fetch_url(client, url, timeout=timeout, user_agent=ua, accept_header=accept)
-        items = parse_rss_items(monitor, body)
+        async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": ua}) as client:
+            items = await fetch_cn_biomed_items(client, feed, monitor, timeout, ua)
         baseline_only = bool(monitor["baseline_on_first_run"]) and not monitor_has_state(name)
         for item in items:
             if not cn_biomed_item_is_recent(item, int(settings["max_age_hours"])):
@@ -4449,6 +4626,10 @@ def cfg_save(new_cfg: dict[str, Any]) -> None:
                 raise ValueError("IVD Feed 的名称和 URL 必填")
             feed["name"] = str(feed["name"]).strip()
             feed["url"] = str(feed["url"]).strip()
+            source_type = str(feed.get("source_type") or "rss").strip().lower()
+            if source_type not in {"rss", "cninfo", "cmde"}:
+                raise ValueError("IVD 来源类型只支持 rss、cninfo 或 cmde")
+            feed["source_type"] = source_type
             feed["enabled"] = bool(feed.get("enabled", True))
             feed["baseline_on_first_run"] = bool(feed.get("baseline_on_first_run", True))
             feed["interval_seconds"] = max(MIN_INTERVAL_SECONDS, safe_int(feed.get("interval_seconds"), DEFAULT_CN_BIOMED_INTERVAL_SECONDS))
@@ -4459,6 +4640,11 @@ def cfg_save(new_cfg: dict[str, Any]) -> None:
                 if not isinstance(values, list):
                     raise ValueError(f"IVD Feed 的 {key} 必须是列表或文本")
                 feed[key] = [str(part).strip() for part in values if str(part).strip()]
+            if source_type == "cninfo":
+                companies = feed.get("companies") or []
+                if not isinstance(companies, list):
+                    raise ValueError("巨潮公司观察名单必须是列表")
+                feed["companies"] = parse_cninfo_company_lines(format_cninfo_company_lines(companies))
     group_monitor_rows = new_cfg.get("group_monitors") or []
     if group_monitor_rows is not None and not isinstance(group_monitor_rows, list):
         raise ValueError("group_monitors 必须是列表")
@@ -4647,9 +4833,34 @@ def monitor_from_form(
     return m
 
 
+def parse_cninfo_company_lines(text: str) -> list[dict[str, str]]:
+    companies: list[dict[str, str]] = []
+    for line in parse_lines(text):
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) != 5:
+            raise ValueError("巨潮公司格式必须是：公司名称|股票代码|组织ID|市场栏目|市场板块")
+        name, code, org_id, column, plate = parts
+        if not name or not code.isdigit() or not org_id or column not in {"szse", "sse"} or plate not in {"sz", "sh"}:
+            raise ValueError(f"巨潮公司配置无效：{line}")
+        companies.append({"name": name, "code": code, "org_id": org_id, "column": column, "plate": plate})
+    if not companies:
+        raise ValueError("巨潮公告来源至少需要一家公司")
+    return companies
+
+
+def format_cninfo_company_lines(companies: list[dict[str, Any]]) -> str:
+    return "\n".join(
+        "|".join(str(company.get(key) or "") for key in ("name", "code", "org_id", "column", "plate"))
+        for company in companies
+        if isinstance(company, dict)
+    )
+
+
 def cn_biomed_feed_from_form(
     name: str,
     url: str,
+    source_type: str,
+    companies: str,
     interval_seconds: int,
     keywords: str,
     exclude_keywords: str,
@@ -4657,9 +4868,11 @@ def cn_biomed_feed_from_form(
     enabled: bool,
     baseline_on_first_run: bool,
 ) -> dict[str, Any]:
+    normalized_source_type = source_type if source_type in {"rss", "cninfo", "cmde"} else "rss"
     feed = {
         "name": name.strip(),
         "url": url.strip(),
+        "source_type": normalized_source_type,
         "enabled": enabled,
         "interval_seconds": max(MIN_INTERVAL_SECONDS, int(interval_seconds or DEFAULT_CN_BIOMED_INTERVAL_SECONDS)),
         "keywords": parse_lines(keywords),
@@ -4667,6 +4880,8 @@ def cn_biomed_feed_from_form(
         "sources": parse_lines(sources),
         "baseline_on_first_run": baseline_on_first_run,
     }
+    if normalized_source_type == "cninfo":
+        feed["companies"] = parse_cninfo_company_lines(companies)
     if not feed["name"] or not feed["url"]:
         raise ValueError("名称和 URL 必填")
     return feed
@@ -4814,19 +5029,25 @@ def cn_biomed_feed_form_html(feed: dict[str, Any] | None = None, idx: int | None
         "interval_seconds": DEFAULT_CN_BIOMED_INTERVAL_SECONDS,
         "enabled": True,
         "baseline_on_first_run": True,
+        "source_type": "rss",
         "keywords": [],
         "exclude_keywords": [],
         "sources": [],
+        "companies": [],
     }
     action = "/cn-biomed/feed/save" if idx is not None else "/cn-biomed/feed/create"
     hidden = f"<input type=hidden name=original_index value='{idx}'>" if idx is not None else ""
     keywords = "\n".join(feed.get("keywords") or [])
     exclude_keywords = "\n".join(feed.get("exclude_keywords") or [])
     sources = "\n".join(feed.get("sources") or [])
+    source_type = str(feed.get("source_type") or "rss")
+    companies = format_cninfo_company_lines(feed.get("companies") or [])
     return f"""<form method=post action='{action}' class=card>{hidden}
 <div class=grid><div><label>来源名称</label><input name=name value='{html_escape(feed.get('name',''))}' required></div>
-<div><label>RSS / Atom URL</label><input name=url value='{html_escape(feed.get('url',''))}' required></div>
+<div><label>来源类型</label><select name=source_type><option value=rss {'selected' if source_type == 'rss' else ''}>RSS / Atom</option><option value=cmde {'selected' if source_type == 'cmde' else ''}>CMDE 网页 / FlareSolverr</option><option value=cninfo {'selected' if source_type == 'cninfo' else ''}>巨潮公告</option></select></div>
+<div><label>RSS / 网页 / API URL</label><input name=url value='{html_escape(feed.get('url',''))}' required></div>
 <div><label>抓取间隔（秒）</label><input name=interval_seconds type=number min=60 value='{html_escape(feed.get('interval_seconds',DEFAULT_CN_BIOMED_INTERVAL_SECONDS))}'></div></div>
+<label>巨潮公司观察名单（仅巨潮公告使用；公司名称|股票代码|组织ID|市场栏目|市场板块）</label><textarea name=companies>{html_escape(companies)}</textarea>
 <label>保留关键词（一行一个，为空则保留该来源全部条目）</label><textarea name=keywords>{html_escape(keywords)}</textarea>
 <label>屏蔽关键词（一行一个）</label><textarea name=exclude_keywords>{html_escape(exclude_keywords)}</textarea>
 <label>媒体来源白名单（一行一个，为空则不限制；主要用于 Google News）</label><textarea name=sources>{html_escape(sources)}</textarea>
@@ -5041,7 +5262,7 @@ button[disabled]{{opacity:.45;cursor:not-allowed}}
             if runtime:
                 runtime_text += f" · {runtime.get('last_duration_ms', 0)}ms · 推送 {runtime.get('last_sent_count', 0)}"
             feed_rows.append(
-                f"<tr><td><b>{html_escape(name)}</b><br><small>{html_escape(feed.get('url',''))}</small></td>"
+                f"<tr><td><b>{html_escape(name)}</b> <span class=badge>{html_escape(feed.get('source_type','rss'))}</span><br><small>{html_escape(feed.get('url',''))}</small></td>"
                 f"<td>{'运行中' if feed.get('enabled', True) else '已停用'}<br><small>{html_escape(feed.get('interval_seconds', DEFAULT_CN_BIOMED_INTERVAL_SECONDS))}s</small></td>"
                 f"<td>{html_escape(', '.join(feed.get('keywords') or []) or '全部')}<br><small>来源：{html_escape(', '.join(feed.get('sources') or []) or '不限')}</small></td>"
                 f"<td>{html_escape(runtime_text)}</td><td><div class=cn-feed-actions><a class=btn href='/cn-biomed/feed/{idx}/edit'>编辑</a> "
@@ -5076,7 +5297,7 @@ button[disabled]{{opacity:.45;cursor:not-allowed}}
 <div class=check-row><label><input type=checkbox name=enabled {'checked' if settings['enabled'] else ''}> 启用 IVD 动态</label>
 <label><input type=checkbox name=translate_titles {'checked' if settings['translate_titles'] else ''}> 英文标题翻译为中文</label></div>
 <div class=form-actions><button class='btn primary' type=submit>保存独立设置</button> <a class=btn href='/restart'>重启机器人</a></div></form></div>
-<div class=card><div class=toolbar><div><h2 style='margin:0 0 6px'>RSS 来源</h2><p class=muted style='margin:0'>当前 {len(settings['feeds'])} 个来源</p></div>
+<div class=card><div class=toolbar><div><h2 style='margin:0 0 6px'>IVD 来源</h2><p class=muted style='margin:0'>当前 {len(settings['feeds'])} 个来源</p></div>
 <div class=actions><form method=post action='/cn-biomed/feeds/init' style='display:inline'><button class=btn type=submit>加入推荐来源</button></form> <a class='btn primary' href='/cn-biomed/feed/new'>新增来源</a> <a class='btn ok' href='/cn-biomed/run-once'>全部检查</a></div></div>
 <div class=table-scroll><table class=cn-feed-table><colgroup><col style='width:30%'><col style='width:11%'><col style='width:25%'><col style='width:18%'><col style='width:16%'></colgroup><tr><th>来源</th><th>状态/间隔</th><th>过滤</th><th>运行状态</th><th>操作</th></tr>{''.join(feed_rows)}</table></div></div>
 <div class=card><h2>最近推送</h2><div class=table-scroll><table class=cn-history-table><colgroup><col style='width:22%'><col style='width:58%'><col style='width:20%'></colgroup><tr><th>来源</th><th>标题/链接</th><th>时间</th></tr>{event_rows}</table></div></div>"""
@@ -5154,6 +5375,8 @@ button[disabled]{{opacity:.45;cursor:not-allowed}}
         original_index: int | None,
         name: str,
         url: str,
+        source_type: str,
+        companies: str,
         interval_seconds: int,
         keywords: str,
         exclude_keywords: str,
@@ -5165,7 +5388,7 @@ button[disabled]{{opacity:.45;cursor:not-allowed}}
         section = cfg.setdefault("cn_biomed", {})
         feeds = section.setdefault("feeds", [])
         feed = cn_biomed_feed_from_form(
-            name, url, interval_seconds, keywords, exclude_keywords, sources, bool(enabled), bool(baseline_on_first_run)
+            name, url, source_type, companies, interval_seconds, keywords, exclude_keywords, sources, bool(enabled), bool(baseline_on_first_run)
         )
         if original_index is None:
             feeds.append(feed)
@@ -5177,12 +5400,12 @@ button[disabled]{{opacity:.45;cursor:not-allowed}}
         return RedirectResponse("/cn-biomed", status_code=303)
 
     @app.post("/cn-biomed/feed/create")
-    async def cn_biomed_feed_create(_: str = Depends(panel_auth), name: str = Form(...), url: str = Form(...), interval_seconds: int = Form(DEFAULT_CN_BIOMED_INTERVAL_SECONDS), keywords: str = Form(""), exclude_keywords: str = Form(""), sources: str = Form(""), enabled: str | None = Form(None), baseline_on_first_run: str | None = Form(None)) -> RedirectResponse:
-        return await save_cn_biomed_feed_common(None, name, url, interval_seconds, keywords, exclude_keywords, sources, enabled, baseline_on_first_run)
+    async def cn_biomed_feed_create(_: str = Depends(panel_auth), name: str = Form(...), url: str = Form(...), source_type: str = Form("rss"), companies: str = Form(""), interval_seconds: int = Form(DEFAULT_CN_BIOMED_INTERVAL_SECONDS), keywords: str = Form(""), exclude_keywords: str = Form(""), sources: str = Form(""), enabled: str | None = Form(None), baseline_on_first_run: str | None = Form(None)) -> RedirectResponse:
+        return await save_cn_biomed_feed_common(None, name, url, source_type, companies, interval_seconds, keywords, exclude_keywords, sources, enabled, baseline_on_first_run)
 
     @app.post("/cn-biomed/feed/save")
-    async def cn_biomed_feed_save(_: str = Depends(panel_auth), original_index: int = Form(...), name: str = Form(...), url: str = Form(...), interval_seconds: int = Form(DEFAULT_CN_BIOMED_INTERVAL_SECONDS), keywords: str = Form(""), exclude_keywords: str = Form(""), sources: str = Form(""), enabled: str | None = Form(None), baseline_on_first_run: str | None = Form(None)) -> RedirectResponse:
-        return await save_cn_biomed_feed_common(original_index, name, url, interval_seconds, keywords, exclude_keywords, sources, enabled, baseline_on_first_run)
+    async def cn_biomed_feed_save(_: str = Depends(panel_auth), original_index: int = Form(...), name: str = Form(...), url: str = Form(...), source_type: str = Form("rss"), companies: str = Form(""), interval_seconds: int = Form(DEFAULT_CN_BIOMED_INTERVAL_SECONDS), keywords: str = Form(""), exclude_keywords: str = Form(""), sources: str = Form(""), enabled: str | None = Form(None), baseline_on_first_run: str | None = Form(None)) -> RedirectResponse:
+        return await save_cn_biomed_feed_common(original_index, name, url, source_type, companies, interval_seconds, keywords, exclude_keywords, sources, enabled, baseline_on_first_run)
 
     @app.get("/cn-biomed/feed/{idx}/delete")
     async def cn_biomed_feed_delete(idx: int, _: str = Depends(panel_auth)) -> RedirectResponse:
@@ -5205,8 +5428,7 @@ button[disabled]{{opacity:.45;cursor:not-allowed}}
         ua = (cfg.get("http") or {}).get("user_agent") or DEFAULT_UA
         try:
             async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": ua}) as client:
-                raw = await fetch_url(client, monitor["url"], timeout=timeout, user_agent=ua)
-            items = parse_rss_items(monitor, raw)
+                items = await fetch_cn_biomed_items(client, feed, monitor, timeout, ua)
             rows: list[str] = []
             for item in items[:30]:
                 recent = cn_biomed_item_is_recent(item, int(settings["max_age_hours"]))
